@@ -51,6 +51,19 @@ class SeasonalityResult(BaseModel):
     dominant_period: Optional[int]   # period with highest FFT power among detected
 
 
+class AnomalyDetail(BaseModel):
+    index: int          # positional index in the original series
+    value: float
+    score: float        # z-score for zscore method, anomaly score for isolation forest
+
+
+class AnomalyResult(BaseModel):
+    anomaly_count: int
+    anomaly_indices: list[int]
+    method_used: str            # "zscore" or "isolation_forest"
+    details: list[AnomalyDetail]
+
+
 class DiagnosisReport(BaseModel):
     datetime_column: Optional[str]   # None when datetime lives in the index
     datetime_in_index: bool
