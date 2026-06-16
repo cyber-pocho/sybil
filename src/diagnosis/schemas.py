@@ -36,6 +36,21 @@ class ColumnDiagnostic(BaseModel):
     stats: Optional[ColumnStats] = None
 
 
+class StationarityResult(BaseModel):
+    is_stationary: bool
+    adf_pvalue: Optional[float]    # None when the series is too short to test
+    kpss_pvalue: Optional[float]
+    recommended_differencing: int  # 0, 1, or 2
+    note: Optional[str] = None     # populated for edge cases (constant, too short)
+
+
+class SeasonalityResult(BaseModel):
+    has_seasonality: bool
+    detected_periods: list[int]      # integer periods in samples, e.g. [7, 14]
+    seasonality_strength: float      # 0–1: seasonal power / total detrended power
+    dominant_period: Optional[int]   # period with highest FFT power among detected
+
+
 class DiagnosisReport(BaseModel):
     datetime_column: Optional[str]   # None when datetime lives in the index
     datetime_in_index: bool
