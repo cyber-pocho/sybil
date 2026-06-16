@@ -1,0 +1,70 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "sibyl"
+version = "0.1.0"
+description = "AI-powered forecasting and analytics service"
+requires-python = ">=3.11"
+dependencies = [
+    # API
+    "fastapi",
+    "uvicorn[standard]",
+    "pydantic>=2.0",
+    # AI / Agents
+    "langgraph",
+    "langchain",
+    "langchain-anthropic",
+    "langchain-community",
+    # Vector search
+    "faiss-cpu",
+    "sentence-transformers",
+    # Forecasting / ML
+    "prophet",
+    "statsmodels",
+    "torch",
+    "mapie",
+    # Data
+    "pandas",
+    "numpy",
+    "scipy",
+    "scikit-learn",
+    # Visualisation
+    "plotly",
+    "matplotlib",
+    # Task queue
+    "celery[redis]",
+    "redis",
+    # Database
+    "sqlalchemy",
+    "asyncpg",
+    "alembic",
+    # Observability / payments
+    "wandb",
+    "stripe",
+    # Utilities
+    "python-dotenv",
+    "httpx",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "ruff",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
