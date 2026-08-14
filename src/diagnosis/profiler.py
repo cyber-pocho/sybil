@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Optional
-
 import pandas as pd
 
 from diagnosis.schemas import (
@@ -20,6 +18,11 @@ _FREQ_BANDS: list[tuple[float, float, DetectedFrequency]] = [
     (2_246_400, 2_851_200, DetectedFrequency.monthly),
 ]
 
+# Max tolerated MAD/median ratio of inter-row gaps before a series is called
+# irregular. 0 for perfectly regular data; stays 0 for a daily series with
+# weekend gaps, since MAD ignores a minority of outlying deltas.
+_MAX_DELTA_DISPERSION = 0.25
+
 
 class DataProfiler:
     def __init__(self, df: pd.DataFrame) -> None:
@@ -29,7 +32,7 @@ class DataProfiler:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _find_datetime(self) -> tuple[Optional[str], bool]:
+    def _find_datetime(self) -> tuple[str | None, bool]:
         """Return (column_name, is_in_index).
 
         Checks the index first, then probes object/string columns with
@@ -51,8 +54,8 @@ class DataProfiler:
         return (None, False)
 
     def _as_datetime_series(
-        self, dt_col: Optional[str], in_index: bool
-    ) -> Optional[pd.Series]:
+        self, dt_col: str | None, in_index: bool
+    ) -> pd.Series | None:
         if in_index:
             return pd.Series(self.df.index, name=dt_col)
         if dt_col is not None:
@@ -65,7 +68,21 @@ class DataProfiler:
         if len(sorted_dt) < 2:
             return DetectedFrequency.irregular
 
-        median_seconds = sorted_dt.diff().dropna().median().total_seconds()
+        deltas = sorted_dt.diff().dropna().dt.total_seconds()
+        median_seconds = float(deltas.median())
+
+        if median_seconds <= 0:
+            return DetectedFrequency.irregular   # all timestamps duplicated
+
+        # The median alone says nothing about how *regularly* spaced the rows are:
+        # deltas of 2 d, 7 d and 36 d have a median of exactly 7 d and would be
+        # reported as clean weekly data. Gate on the median absolute deviation to
+        # catch that. MAD is used rather than the standard deviation because it
+        # ignores a minority of odd gaps — a daily series that skips weekends has
+        # MAD 0 and should still read as daily.
+        mad_seconds = float((deltas - median_seconds).abs().median())
+        if mad_seconds / median_seconds > _MAX_DELTA_DISPERSION:
+            return DetectedFrequency.irregular
 
         for lo, hi, freq in _FREQ_BANDS:
             if lo <= median_seconds <= hi:
@@ -106,7 +123,7 @@ class DataProfiler:
             c for c in analysis_cols if not pd.api.types.is_numeric_dtype(df[c])
         ]
 
-        date_range: Optional[DateRange] = None
+        date_range: DateRange | None = None
         detected_freq = DetectedFrequency.irregular
         dup_timestamps = 0
 

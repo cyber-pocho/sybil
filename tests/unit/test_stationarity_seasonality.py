@@ -2,9 +2,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from diagnosis.seasonality import detect_seasonality
 from diagnosis.schemas import SeasonalityResult, StationarityResult
-from diagnosis.stationarity import test_stationarity
+from diagnosis.seasonality import detect_seasonality
+from diagnosis.stationarity import check_stationarity
 
 RNG = np.random.default_rng(42)
 
@@ -41,7 +41,7 @@ def flat_noise_series() -> pd.Series:
 # ── stationarity ─────────────────────────────────────────────────────────────
 
 def test_white_noise_is_stationary(stationary_series):
-    r = test_stationarity(stationary_series)
+    r = check_stationarity(stationary_series)
     assert r.is_stationary is True
     assert r.recommended_differencing == 0
     assert r.adf_pvalue < 0.05
@@ -49,17 +49,17 @@ def test_white_noise_is_stationary(stationary_series):
 
 
 def test_random_walk_is_not_stationary(trend_series):
-    r = test_stationarity(trend_series)
+    r = check_stationarity(trend_series)
     assert r.is_stationary is False
 
 
 def test_random_walk_recommends_one_difference(trend_series):
-    r = test_stationarity(trend_series)
+    r = check_stationarity(trend_series)
     assert r.recommended_differencing >= 1
 
 
 def test_too_short_series_returns_safely():
-    r = test_stationarity(pd.Series([1.0, 2.0, 3.0]))
+    r = check_stationarity(pd.Series([1.0, 2.0, 3.0]))
     assert r.is_stationary is False
     assert r.adf_pvalue is None
     assert r.kpss_pvalue is None
@@ -67,7 +67,7 @@ def test_too_short_series_returns_safely():
 
 
 def test_constant_series_is_stationary():
-    r = test_stationarity(pd.Series([5.0] * 50))
+    r = check_stationarity(pd.Series([5.0] * 50))
     assert r.is_stationary is True
     assert r.recommended_differencing == 0
     assert "constant" in (r.note or "")
@@ -76,12 +76,12 @@ def test_constant_series_is_stationary():
 def test_series_with_nans_handled(stationary_series):
     with_nans = stationary_series.copy()
     with_nans.iloc[::10] = np.nan   # 10 % missing
-    r = test_stationarity(with_nans)
+    r = check_stationarity(with_nans)
     assert isinstance(r, StationarityResult)
 
 
 def test_returns_stationarity_result(stationary_series):
-    assert isinstance(test_stationarity(stationary_series), StationarityResult)
+    assert isinstance(check_stationarity(stationary_series), StationarityResult)
 
 
 # ── seasonality ──────────────────────────────────────────────────────────────
@@ -120,7 +120,7 @@ def test_too_short_series_no_seasonality():
     assert r.seasonality_strength == 0.0
 
 
-def test_series_with_nans_handled(weekly_seasonal_series):
+def test_seasonality_series_with_nans_handled(weekly_seasonal_series):
     with_nans = weekly_seasonal_series.copy()
     with_nans.iloc[::20] = np.nan
     r = detect_seasonality(with_nans, freq="D")

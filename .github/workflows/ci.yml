@@ -16,10 +16,12 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install -e ".[dev]"
+        run: pip install -e ".[dev,api]"
 
       - name: Lint
         run: ruff check src/ tests/
 
+      # tests/ rather than tests/unit/ — the integration suite is the only
+      # end-to-end cover of run_full_diagnosis and was never being run.
       - name: Test
-        run: pytest tests/unit/ -v
+        run: pytest tests/ -v

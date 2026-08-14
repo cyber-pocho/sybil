@@ -6,20 +6,13 @@ Coverage tests: the key statistical claim is that conformal prediction gives
 predicted by a ConformalWrapper(ProphetForecaster). With 90 calibration points,
 the quantile formula guarantees coverage ≥ nominal; we allow a ±10 % band
 around the target to account for empirical variance over 50 test points.
-
-MAPIEWrapper tests are skipped when MAPIE is not installed.
 """
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from forecasting.conformal import (
-    ConformalWrapper,
-    MAPIEWrapper,
-    _conformal_quantile,
-    _MAPIE_AVAILABLE,
-)
+from forecasting.conformal import ConformalWrapper, _conformal_quantile
 from forecasting.prophet_model import ProphetForecaster
 from forecasting.schemas import ForecastResult
 
@@ -70,8 +63,17 @@ def forecast(wrapper) -> ForecastResult:
 
 def test_quantile_returns_correct_order_stat():
     scores = np.array([1.0, 2.0, 3.0, 4.0, 5.0])   # already sorted
-    # alpha=0.0 → level = ceil(1.0 * 6) = 6 → scores[5-1] = scores[4] = 5.0
-    assert _conformal_quantile(scores, 5, alpha=0.0) == 5.0
+    # alpha=0.20 → level = ceil(0.80 * 6) = ceil(4.8) = 5 → scores[5-1] = 5.0
+    assert _conformal_quantile(scores, 5, alpha=0.20) == 5.0
+    # alpha=0.50 → level = ceil(0.50 * 6) = 3 → scores[3-1] = 3.0
+    assert _conformal_quantile(scores, 5, alpha=0.50) == 3.0
+
+
+def test_quantile_alpha_zero_is_degenerate():
+    scores = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+    # alpha=0 demands 100 % coverage: level = ceil(1.0 * 6) = 6 > n=5, so no
+    # finite order statistic can bound it. Infinite width is the honest answer.
+    assert _conformal_quantile(scores, 5, alpha=0.0) == float("inf")
 
 
 def test_quantile_80_percent():
@@ -211,32 +213,3 @@ def test_card_inherits_base_best_for():
 def test_card_supports_conformal():
     w = ConformalWrapper(ProphetForecaster())
     assert w.card.supports_uncertainty == "conformal"
-
-
-# ── MAPIEWrapper (skipped when MAPIE absent) ──────────────────────────────────
-
-@pytest.mark.skipif(not _MAPIE_AVAILABLE, reason="MAPIE not installed")
-def test_mapie_wrapper_produces_forecast_result():
-    fc = ProphetForecaster(yearly_seasonality=False, weekly_seasonality=True, daily_seasonality=False)
-    w  = MAPIEWrapper(fc)
-    w.fit(_FIT)
-    r  = w.predict(14)
-    assert isinstance(r, ForecastResult)
-    assert len(r.point_forecast) == 14
-
-
-@pytest.mark.skipif(not _MAPIE_AVAILABLE, reason="MAPIE not installed")
-def test_mapie_wrapper_interval_ordering():
-    fc = ProphetForecaster(yearly_seasonality=False, weekly_seasonality=True, daily_seasonality=False)
-    w  = MAPIEWrapper(fc)
-    w.fit(_FIT)
-    r  = w.predict(14)
-    assert all(lo <= pt <= hi for lo, pt, hi in zip(r.lower_80, r.point_forecast, r.upper_80))
-    assert all(lo <= pt <= hi for lo, pt, hi in zip(r.lower_95, r.point_forecast, r.upper_95))
-
-
-def test_mapie_wrapper_raises_without_mapie(monkeypatch):
-    import forecasting.conformal as cm
-    monkeypatch.setattr(cm, "_MAPIE_AVAILABLE", False)
-    with pytest.raises(ImportError, match="pip install mapie"):
-        MAPIEWrapper(ProphetForecaster())

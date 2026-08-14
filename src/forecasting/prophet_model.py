@@ -63,9 +63,13 @@ class ProphetForecaster(BaseForecaster):
                 "Fourier-basis seasonalities, and optional holiday effects. "
                 "Tolerates gaps and outliers without preprocessing."
             ),
-            best_for="Series with strong trend and clear weekly/yearly seasonality over ≥2 full seasonal cycles.",
+            best_for=(
+                "Series with strong trend and clear weekly/yearly seasonality "
+                "over ≥2 full seasonal cycles."
+            ),
             handles_missing=True,
-            min_samples_required=100,   # need enough history for changepoint detection to be meaningful
+            # need enough history for changepoint detection to be meaningful
+            min_samples_required=100,
             supports_uncertainty="native",
         )
 

@@ -19,7 +19,6 @@ practical fix used by ARIMA pipelines: try d=1, then d=2.
 
 import warnings
 
-import numpy as np
 import pandas as pd
 from statsmodels.tsa.stattools import adfuller, kpss
 
@@ -28,7 +27,7 @@ from diagnosis.schemas import StationarityResult
 _MIN_OBS = 20   # below this both tests have unreliable asymptotic distributions
 
 
-def test_stationarity(series: pd.Series) -> StationarityResult:
+def check_stationarity(series: pd.Series) -> StationarityResult:
     s = series.dropna()
 
     if len(s) < _MIN_OBS:

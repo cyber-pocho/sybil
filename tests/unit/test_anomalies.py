@@ -53,10 +53,16 @@ def test_zscore_constant_series_returns_empty():
     assert zscore_anomalies(pd.Series([7.0] * 100)) == []
 
 
-def test_zscore_nans_ignored():
-    s = pd.Series([1.0, np.nan, 2.0, 100.0])
-    details = zscore_anomalies(s)
-    assert any(d.value == 100.0 for d in details)
+def test_zscore_nans_ignored(spiked_series):
+    # NaNs must be dropped before the z-score, not propagated into μ and σ.
+    # The series needs enough points for a 3σ outlier to be attainable at all:
+    # with n observations the largest possible |z| is (n-1)/√n, so a 4-point
+    # series can never exceed 3σ no matter how extreme the outlier.
+    with_nans = spiked_series.copy()
+    with_nans.iloc[::7] = np.nan   # ~14 % missing; 20, 80, 150 are not multiples of 7
+
+    found = {d.index for d in zscore_anomalies(with_nans)}
+    assert set(SPIKE_POSITIONS).issubset(found)
 
 
 # ── isolation forest ──────────────────────────────────────────────────────────

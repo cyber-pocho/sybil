@@ -1,58 +1,82 @@
 [build-system]
 requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "sibyl"
 version = "0.1.0"
 description = "AI-powered forecasting and analytics service"
 requires-python = ">=3.11"
+
+# Core = what the diagnosis and forecasting layers actually import today.
+# Everything else lives in an extra, so a plain `pip install sibyl` does not
+# drag in torch or a database driver to profile a DataFrame.
+#
+# Upper bounds are deliberate. An unpinned `mapie` is how a removed class
+# (MapieRegressor, gone in MAPIE 1.x) silently turned a wrapper into dead code
+# that still imported cleanly. Ceilings make that failure loud at install time.
 dependencies = [
-    # API
-    "fastapi",
-    "uvicorn[standard]",
-    "pydantic>=2.0",
-    # AI / Agents
-    "langgraph",
-    "langchain",
-    "langchain-anthropic",
-    "langchain-community",
-    # Vector search
-    "faiss-cpu",
-    "sentence-transformers",
-    # Forecasting / ML
-    "prophet",
-    "statsmodels",
-    "torch",
-    "mapie",
-    # Data
-    "pandas",
-    "numpy",
-    "scipy",
-    "scikit-learn",
-    # Visualisation
-    "plotly",
-    "matplotlib",
-    # Task queue
-    "celery[redis]",
-    "redis",
-    # Database
-    "sqlalchemy",
-    "asyncpg",
-    "alembic",
-    # Observability / payments
-    "wandb",
-    "stripe",
+    # Data / numerics
+    "pandas>=2.1,<3.1",
+    "numpy>=1.26,<3",
+    "scipy>=1.11,<2",
+    "scikit-learn>=1.3,<2",
+    # Forecasting
+    "statsmodels>=0.14,<0.16",
+    "prophet>=1.1,<2",
+    # Schemas
+    "pydantic>=2.0,<3",
     # Utilities
-    "python-dotenv",
-    "httpx",
+    "python-dotenv>=1.0,<2",
 ]
 
 [project.optional-dependencies]
+# The HTTP service. Required by `make run-api` and the Docker image.
+api = [
+    "fastapi>=0.110,<1",
+    "uvicorn[standard]>=0.27,<1",
+]
+
+# LangGraph agent layer — not yet implemented (src/sibyl/agents/ is empty).
+agents = [
+    "langgraph>=0.2,<1",
+    "langchain>=0.3,<1",
+    "langchain-anthropic>=0.3,<1",
+    "langchain-community>=0.3,<1",
+    "faiss-cpu>=1.8,<2",
+    "sentence-transformers>=3.0,<6",
+    "torch>=2.2,<3",
+]
+
+# Celery workers — not yet implemented (src/sibyl/tasks/ is empty).
+workers = [
+    "celery[redis]>=5.3,<6",
+    "redis>=5.0,<7",
+]
+
+# Persistence — not yet implemented (src/sibyl/db/ is empty).
+db = [
+    "sqlalchemy>=2.0,<3",
+    "asyncpg>=0.29,<1",
+    "alembic>=1.13,<2",
+]
+
+viz = [
+    "plotly>=5.20,<7",
+    "matplotlib>=3.8,<4",
+]
+
+# Experiment tracking and billing — not yet wired up.
+ops = [
+    "wandb>=0.17,<1",
+    "stripe>=9.0,<15",
+]
+
 dev = [
-    "pytest",
-    "pytest-asyncio",
-    "ruff",
+    "pytest>=8.0,<10",
+    "pytest-asyncio>=0.23,<2",
+    "httpx>=0.27,<1",   # required by fastapi.testclient.TestClient
+    "ruff>=0.6,<1",
 ]
 
 [tool.setuptools.packages.find]

@@ -1,11 +1,10 @@
 from datetime import datetime
-from enum import Enum
-from typing import Optional
+from enum import StrEnum
 
 from pydantic import BaseModel
 
 
-class DetectedFrequency(str, Enum):
+class DetectedFrequency(StrEnum):
     hourly = "hourly"
     daily = "daily"
     weekly = "weekly"
@@ -34,22 +33,22 @@ class ColumnDiagnostic(BaseModel):
     missing_pct: float
     is_numeric: bool
     is_categorical: bool
-    stats: Optional[ColumnStats] = None
+    stats: ColumnStats | None = None
 
 
 class StationarityResult(BaseModel):
     is_stationary: bool
-    adf_pvalue: Optional[float]    # None when the series is too short to test
-    kpss_pvalue: Optional[float]
+    adf_pvalue: float | None    # None when the series is too short to test
+    kpss_pvalue: float | None
     recommended_differencing: int  # 0, 1, or 2
-    note: Optional[str] = None     # populated for edge cases (constant, too short)
+    note: str | None = None     # populated for edge cases (constant, too short)
 
 
 class SeasonalityResult(BaseModel):
     has_seasonality: bool
     detected_periods: list[int]      # integer periods in samples, e.g. [7, 14]
     seasonality_strength: float      # 0–1: seasonal power / total detrended power
-    dominant_period: Optional[int]   # period with highest FFT power among detected
+    dominant_period: int | None   # period with highest FFT power among detected
 
 
 class AnomalyDetail(BaseModel):
@@ -66,12 +65,12 @@ class AnomalyResult(BaseModel):
 
 
 class DiagnosisReport(BaseModel):
-    datetime_column: Optional[str]   # None when datetime lives in the index
+    datetime_column: str | None   # None when datetime lives in the index
     datetime_in_index: bool
     numeric_columns: list[str]
     categorical_columns: list[str]
     row_count: int
-    date_range: Optional[DateRange]
+    date_range: DateRange | None
     detected_frequency: DetectedFrequency
     duplicate_timestamps: int
     columns: list[ColumnDiagnostic]
@@ -109,7 +108,10 @@ class FullDiagnosisReport(BaseModel):
 
         # ── line 3: missing values ───────────────────────────────────────────
         if target_diag and target_diag.missing_count > 0:
-            l3 = f"{target_diag.missing_count} missing values detected ({target_diag.missing_pct:.1f}%)."
+            l3 = (
+                f"{target_diag.missing_count} missing values detected "
+                f"({target_diag.missing_pct:.1f}%)."
+            )
         else:
             l3 = "No missing values in target column."
 
@@ -117,10 +119,16 @@ class FullDiagnosisReport(BaseModel):
         if stat.adf_pvalue is None:
             l4 = f"Stationarity test skipped ({stat.note})."
         elif stat.is_stationary:
-            l4 = f"Series is stationary (ADF p={stat.adf_pvalue:.2f}, KPSS p={stat.kpss_pvalue:.2f})."
+            l4 = (
+                f"Series is stationary "
+                f"(ADF p={stat.adf_pvalue:.2f}, KPSS p={stat.kpss_pvalue:.2f})."
+            )
         else:
             d_word = {1: "First", 2: "Second"}.get(stat.recommended_differencing, "Higher-order")
-            l4 = f"Series is non-stationary (ADF p={stat.adf_pvalue:.2f}). {d_word} differencing recommended."
+            l4 = (
+                f"Series is non-stationary (ADF p={stat.adf_pvalue:.2f}). "
+                f"{d_word} differencing recommended."
+            )
 
         # ── line 5: seasonality ──────────────────────────────────────────────
         if seas.has_seasonality:
@@ -129,7 +137,11 @@ class FullDiagnosisReport(BaseModel):
                 "Moderate" if seas.seasonality_strength >= 0.3 else
                 "Weak"
             )
-            l5 = f"{strength_label} seasonality detected (period={seas.dominant_period}, strength={seas.seasonality_strength:.2f})."
+            l5 = (
+                f"{strength_label} seasonality detected "
+                f"(period={seas.dominant_period}, "
+                f"strength={seas.seasonality_strength:.2f})."
+            )
         else:
             l5 = "No clear seasonality detected."
 

@@ -5,7 +5,6 @@ import pytest
 from diagnosis.profiler import DataProfiler, profile
 from diagnosis.schemas import DetectedFrequency, DiagnosisReport
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------

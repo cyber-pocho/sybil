@@ -1,21 +1,21 @@
 services:
   api:
     build: .
+    # Entry point comes from the image CMD: sibyl.api.app:create_app
     ports:
       - "8000:8000"
-    env_file: .env
+    # Optional: .env is gitignored, and nothing in the app reads it yet, so a
+    # fresh clone should still come up rather than failing on a missing file.
+    env_file:
+      - path: .env
+        required: false
     depends_on:
       - redis
       - postgres
 
-  worker:
-    build: .
-    command: celery -A src.api.tasks worker --loglevel=info
-    env_file: .env
-    depends_on:
-      - redis
-      - postgres
-
+  # A `worker` service ran `celery -A src.api.tasks`, a module that has never
+  # existed — it could only ever crash-loop. It comes back when src/sibyl/tasks/
+  # has real tasks in it, pointing at sibyl.tasks.
   redis:
     image: redis:7-alpine
     ports:

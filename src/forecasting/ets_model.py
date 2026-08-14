@@ -84,9 +84,13 @@ class ETSForecaster(BaseForecaster):
                 "Generalises Holt-Winters with additive or multiplicative components. "
                 "Fits analytically via maximum likelihood; prediction intervals are exact."
             ),
-            best_for="Medium-length series (50–2000 obs) with stable trend and seasonality, no regressors needed.",
+            best_for=(
+                "Medium-length series (50–2000 obs) with stable trend and "
+                "seasonality, no regressors needed."
+            ),
             handles_missing=False,    # statsmodels ETSModel requires a complete series
-            min_samples_required=24,  # need at least a couple of seasonal cycles to identify components
+            # need at least a couple of seasonal cycles to identify components
+            min_samples_required=24,
             supports_uncertainty="native",
         )
 
@@ -135,27 +139,32 @@ class ETSForecaster(BaseForecaster):
 
         n = len(self._series_index)
 
-        # Integer positions: start at the first out-of-sample step
-        pred_80 = self._result.get_prediction(start=n, end=n + horizon - 1)
-        pred_95 = self._result.get_prediction(start=n, end=n + horizon - 1)
+        # Integer positions: start at the first out-of-sample step.
+        # One prediction object serves both interval levels — alpha is applied
+        # downstream in summary_frame(), not here.
+        pred = self._result.get_prediction(start=n, end=n + horizon - 1)
 
-        # summary_frame(alpha) returns: mean, mean_se, mean_ci_lower, mean_ci_upper
-        frame_80 = pred_80.summary_frame(alpha=0.20)
-        frame_95 = pred_95.summary_frame(alpha=0.05)
+        # ETSResults.summary_frame(alpha) returns: mean, pi_lower, pi_upper.
+        # Note this differs from SARIMAX, which names the same columns
+        # mean_ci_lower / mean_ci_upper — ETS uses the pi_* spelling.
+        frame_80 = pred.summary_frame(alpha=0.20)
+        frame_95 = pred.summary_frame(alpha=0.05)
 
         # Generate future timestamps from the index frequency
         freq = self._series_index.freq or pd.tseries.frequencies.to_offset(
             pd.infer_freq(self._series_index)
         )
-        future_index = pd.date_range(start=self._series_index[-1], periods=horizon + 1, freq=freq)[1:]
+        future_index = pd.date_range(
+            start=self._series_index[-1], periods=horizon + 1, freq=freq
+        )[1:]
 
         return ForecastResult(
             timestamps=future_index.tolist(),
             point_forecast=frame_80["mean"].tolist(),
-            lower_80=frame_80["mean_ci_lower"].tolist(),
-            upper_80=frame_80["mean_ci_upper"].tolist(),
-            lower_95=frame_95["mean_ci_lower"].tolist(),
-            upper_95=frame_95["mean_ci_upper"].tolist(),
+            lower_80=frame_80["pi_lower"].tolist(),
+            upper_80=frame_80["pi_upper"].tolist(),
+            lower_95=frame_95["pi_lower"].tolist(),
+            upper_95=frame_95["pi_upper"].tolist(),
             model_name=self.name,
             fit_time_seconds=round(self._fit_time, 3),
             metadata={
