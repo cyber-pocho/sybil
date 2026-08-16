@@ -16,7 +16,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install -e ".[dev,api]"
+        run: pip install -e ".[dev,api,agents]"
 
       - name: Lint
         run: ruff check src/ tests/

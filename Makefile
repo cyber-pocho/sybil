@@ -1,7 +1,7 @@
 .PHONY: install test lint run-api docker-build docker-up
 
 install:
-	pip install -e ".[dev,api]"
+	pip install -e ".[dev,api,agents]"
 
 test:
 	pytest

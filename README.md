@@ -13,7 +13,8 @@ Sibyl ingests raw time-series DataFrames and runs a layered diagnostic suite: pr
 | Diagnosis (`src/diagnosis/`) | ✅ Implemented, fully covered |
 | Forecasting (`src/forecasting/`) | ✅ Prophet, ETS, split-conformal intervals |
 | HTTP API (`src/sibyl/api/`) | 🟡 `/health` and `/diagnose` only |
-| Agents, tasks, persistence | ⛔ Not started — empty packages |
+| Agent (`src/sibyl/agents/`) | ✅ LangGraph model-selection agent |
+| Tasks, persistence, vector search | ⛔ Not started — empty packages |
 
 ## Project layout
 
@@ -34,16 +35,19 @@ src/
 │   └── schemas.py      # ForecastResult, ModelCard
 └── sibyl/              # Application layer
     ├── api/app.py      # FastAPI factory — the service entry point
-    ├── agents/         # LangGraph agents      (empty)
+    ├── agents/
+    │   └── forecaster_agent.py  # LangGraph agent: diagnose → pick a model → explain
     ├── services/       # Business logic        (empty)
     ├── tasks/          # Celery workers        (empty)
     ├── models/         #                       (empty)
     └── db/             # SQLAlchemy, Alembic   (empty)
 
 tests/
-├── unit/               # Per-module tests
+├── unit/               # Per-module tests; the agent runs against a stub LLM
 └── integration/        # End-to-end run_full_diagnosis coverage
 ```
+
+172 tests, no skips. `ruff check` clean.
 
 ## Diagnostic pipeline
 
@@ -147,6 +151,37 @@ result = model.predict(horizon=30)
 
 `ConformalWrapper` replaces a model's native intervals with distribution-free ones: it trains the base model on the first 70 %, scores absolute residuals on the last 30 %, and applies the exact finite-sample quantile `⌈(1-α)(n+1)⌉` (Angelopoulos & Bates 2021, Thm 1). When the calibration set is too small to bound the level, it returns infinite width rather than silently under-covering. Empirical coverage at 80 % and 95 % is asserted in the test suite.
 
+## Agent
+
+`src/sibyl/agents/` is a LangGraph agent that runs the diagnosis, reads the
+`ModelCard` of each forecaster, picks one, and explains the choice in terms of what
+the diagnosis found. Model selection is the LLM's decision, not a rule table — the
+cards are the evidence it reasons over.
+
+```python
+from sibyl.agents.forecaster_agent import run_agent
+
+run = run_agent(series, horizon=30)   # series needs a DatetimeIndex
+run.explanation                       # why it picked that model, in its own words
+run.model_used                        # e.g. "prophet" or "conformal(ets)"
+run.forecast                          # ForecastResult
+run.diagnosis                         # FullDiagnosisReport
+run.messages                          # full transcript, for debugging
+```
+
+The graph is the standard two-node ReAct loop — `START → agent ⇄ tools → END` —
+with three tools: `diagnose`, `list_models`, and `run_forecast`. It runs until the
+model stops calling tools, bounded by `recursion_limit`.
+
+Defaults to **Claude Opus 5** (`claude-opus-5`) with adaptive thinking, so the model
+decides how much to reason per call. Set `ANTHROPIC_API_KEY` to run it. Any
+tool-calling chat model can be injected instead via `run_agent(..., llm=...)` — the
+test suite passes a stub, which is why CI needs no API key.
+
+⚠️ The graph, the tools, and the result plumbing are covered by tests against that
+stub. The live Claude round-trip is **not** yet exercised — no run against the real
+API has happened. Expect to iterate on the system prompt the first time you do.
+
 ## HTTP API
 
 ```bash
@@ -176,7 +211,8 @@ Core install is the numeric stack only. Everything else is an extra, so profilin
 | Forecasting | Prophet, statsmodels | *(core)* | in use |
 | Schemas | Pydantic v2 | *(core)* | in use |
 | API | FastAPI, uvicorn | `[api]` | in use |
-| Agents | LangGraph, LangChain, FAISS, PyTorch | `[agents]` | planned |
+| Agent | LangGraph, langchain-anthropic | `[agents]` | in use |
+| Vector search | FAISS, sentence-transformers, PyTorch | `[vectorsearch]` | planned |
 | Task queue | Celery + Redis | `[workers]` | planned |
 | Database | SQLAlchemy, asyncpg, Alembic | `[db]` | planned |
 | Visualisation | Plotly, matplotlib | `[viz]` | planned |
@@ -187,8 +223,8 @@ Dependencies carry upper version bounds. This is deliberate: an unpinned `mapie`
 ## Getting started
 
 ```bash
-# Install (core + dev tools + API)
-make install          # pip install -e ".[dev,api]"
+# Install (core + dev tools + API + agent)
+make install          # pip install -e ".[dev,api,agents]"
 
 # Run tests
 make test             # pytest → tests/unit + tests/integration
@@ -207,8 +243,10 @@ make docker-up        # api + redis + postgres
 
 `.env.example` lists the variables the planned layers will need (`ANTHROPIC_API_KEY`, `DATABASE_URL`, `REDIS_URL`, `WANDB_API_KEY`, `STRIPE_SECRET_KEY`, `FAISS_INDEX_PATH`).
 
-**None of them are read by any code today**, and `.env` is optional — the API and `docker compose up` both start without one. They become required as the agent, database and billing layers land.
+`ANTHROPIC_API_KEY` is read by the agent (via `langchain-anthropic`) when you run it
+against real Claude; the rest are not read by any code today. `.env` stays optional —
+the API and `docker compose up` both start without one.
 
 ## CI
 
-GitHub Actions runs on every push to `main` and all PRs: `ruff check src/ tests/`, then `pytest tests/ -v` across both the unit and integration suites. `make lint` runs the identical lint command, so a green local run means a green CI run.
+GitHub Actions runs on every push to `main` and all PRs: `ruff check src/ tests/`, then `pytest tests/ -v` across both the unit and integration suites. The agent tests run against a stub LLM, so no API key is needed. `make lint` runs the identical lint command, so a green local run means a green CI run.

@@ -37,12 +37,18 @@ api = [
     "uvicorn[standard]>=0.27,<1",
 ]
 
-# LangGraph agent layer — not yet implemented (src/sibyl/agents/ is empty).
+# LangGraph agent that picks a forecasting model and explains the choice.
+# Only what src/sibyl/agents/ actually imports — the vector-search stack that
+# used to live here moved to [vectorsearch], so installing the agent no longer
+# pulls in torch.
 agents = [
-    "langgraph>=0.2,<1",
-    "langchain>=0.3,<1",
+    "langgraph>=0.6,<1",
+    "langchain-core>=0.3,<1",
     "langchain-anthropic>=0.3,<1",
-    "langchain-community>=0.3,<1",
+]
+
+# Semantic retrieval over past forecasts — not yet implemented.
+vectorsearch = [
     "faiss-cpu>=1.8,<2",
     "sentence-transformers>=3.0,<6",
     "torch>=2.2,<3",
