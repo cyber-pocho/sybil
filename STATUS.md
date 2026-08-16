@@ -1,7 +1,7 @@
 # Sibyl — Project Status Report
 
-**Date:** 2026-08-15
-**Branch:** `main` @ `443e661` + uncommitted agent layer
+**Date:** 2026-08-16
+**Branch:** `main` @ `d9f8f5c` + uncommitted provider-agnostic agent layer
 **Basis:** full read-through, plus clean-room install / lint / test, a Docker build and
 container probe, and the GitHub Actions history
 
@@ -14,9 +14,12 @@ persistence and vector search remain unstarted. The repository's defining proble
 a broken build backend that made `pip install -e .` fail, so **CI failed on all 10
 commits and never executed a single test** — is fixed, and CI has since gone green
 twice on Python 3.11. The suite went from *119 passed / 8 failed / 20 errors / 2
-skipped* to **172 passed, 0 failed, 0 skipped**; `ruff check` from 30 errors to
-clean. The Docker image builds, runs, and serves both endpoints. The one thing built
-but not yet exercised against reality is the agent's live Claude round-trip.
+skipped* to **207 passed, 0 failed, 0 skipped**; `ruff check` from 30 errors to
+clean. The Docker image builds, runs, and serves both endpoints. The agent is now
+provider-agnostic — it runs on any tool-calling chat model, closed or open weights —
+and that change surfaced a second dependency-ceiling bug of the same family as the
+original MAPIE one. The one thing built but not yet exercised against reality is a
+live round-trip against any real provider.
 
 ---
 
@@ -38,11 +41,12 @@ Everything below was executed, not inferred.
 |---|---|---|
 | `pip install -e .` | ❌ `BackendUnavailable` | ✅ exit 0 |
 | CI outcome | ❌ 10/10 runs failed at install | ✅ green |
-| Tests executed in CI | **0, ever** | 172 |
-| Test results | 119 pass / 8 fail / 20 error / 2 skip | **172 pass / 0 fail / 0 skip** |
+| Tests executed in CI | **0, ever** | 207 |
+| Test results | 119 pass / 8 fail / 20 error / 2 skip | **207 pass / 0 fail / 0 skip** |
 | `ruff check` | 30 errors | **0** |
-| Source LOC | 1,383 | 1,615 |
-| Test LOC | 1,226 | 1,490 |
+| Source LOC | 1,383 | 1,836 |
+| Test LOC | 1,226 | 1,714 |
+| LLM providers supported | 1 (hardcoded) | **7, none privileged** |
 
 ---
 
@@ -61,7 +65,8 @@ Everything below was executed, not inferred.
 | `forecasting/ets_model.py` | 206 | 28 | ✅ **fixed** — was completely broken |
 | `forecasting/conformal.py` | 133 | 22 | ✅ `ConformalWrapper` only; MAPIE removed |
 | `sibyl/api/app.py` | 60 | 10 | 🟡 `/health` + `/diagnose`; verified under uvicorn and in Docker |
-| `sibyl/agents/forecaster_agent.py` | 247 | 15 | 🟡 graph tested against a stub; **live Claude call unverified** |
+| `sibyl/agents/forecaster_agent.py` | 250 | 18 | 🟡 graph tested against a stub; **no live call to any provider yet** |
+| `sibyl/agents/llm.py` | 218 | 32 | ✅ provider registry; 7 providers, 3 constructed for real |
 | `sibyl/{services,tasks,db,models}` | 0 | — | ⛔ not started |
 
 ---
@@ -154,7 +159,33 @@ bundled FAISS, sentence-transformers and torch, none of which the agent imports.
 Those moved to `[vectorsearch]` (unimplemented), so a `[dev,api,agents]` install pulls
 none of them — verified against the installed set.
 
-### 8. Config drift closed
+### 8. Version ceilings that had inverted — the MAPIE lesson, backwards
+
+Making the agent provider-agnostic meant adding provider extras, and coherent extras
+forced a look at the existing pins. All three were stale:
+
+| Pin | Current release | Effect |
+|---|---|---|
+| `langgraph>=0.6,<1` | 1.2.11 | every 1.x release excluded |
+| `langchain-core>=0.3,<1` | 1.5.5 | every 1.x release excluded |
+| `langchain-anthropic>=0.3,<1` | 1.5.6 | every 1.x release excluded |
+
+These predated LangChain's 1.0 and had quietly become the **opposite of what a ceiling
+is for**. Instead of guarding against a breaking change, they were pinning the project
+to an end-of-life major version and silently resolving to it on every fresh install.
+
+This is the MAPIE failure mode inverted, and it is worth stating as a general rule: an
+upper bound is a claim about the future that expires. MAPIE showed what happens with no
+ceiling; this shows what happens when a ceiling is never revisited. Both end the same
+way — installing something other than what the author believed was installed.
+
+Not a judgement call: **the suite passes unmodified on LangChain 1.x**, checked before
+touching the pins. All ceilings moved to `<2`, and every provider extra was dry-run
+resolved. The `<1` pins would also have made the provider extras unsatisfiable —
+`langchain-openai` 1.x requires `langchain-core` 1.x, which `langchain-core<1` forbids —
+so this was load-bearing for the refactor, not incidental tidying.
+
+### 9. Config drift closed
 
 Three files named three different, mutually inconsistent, non-existent entry points.
 All now agree on `sibyl.api.app:create_app` (factory mode), verified to boot both
@@ -193,23 +224,99 @@ This is the consumer `BaseForecaster.card` was written for — its docstring alr
 said the card is *"returned by the agent when it explains its model selection to the
 user"*. That consumer now exists.
 
-Defaults to **`claude-opus-5`** with `thinking: {"type": "adaptive"}`. Both were
-checked against the current API reference rather than written from memory — the model
-ID takes no date suffix, and `budget_tokens` is removed on this model in favour of
-adaptive thinking. That `langchain-anthropic` forwards both to the request payload
-unaltered was verified by inspecting the built payload.
-
 Tools close over one series rather than taking it as an argument: a DataFrame cannot
 survive a round trip through a JSON tool call. An unknown model name returns an error
 string rather than raising, so the agent can correct itself instead of aborting the
 graph; a `recursion_limit` bounds runaway loops.
 
-**Fifteen tests, all against an injected stub LLM** — a real call would be
-non-deterministic, slow, and would need `ANTHROPIC_API_KEY` in CI, none of which
+**Eighteen tests, all against an injected stub LLM** — a real call would be
+non-deterministic, slow, and would need some vendor's credential in CI, none of which
 tests the graph. One of those tests initially passed for the wrong reason: the stub
 replayed a single `AIMessage` object, and LangGraph's `add_messages` reducer merges by
 id, so repeat turns silently overwrote instead of appending and the runaway loop could
 not run away. The stub now mints a fresh id per reply.
+
+### Provider registry — `src/sibyl/agents/llm.py`
+
+The agent originally hardcoded `ChatAnthropic` and `claude-opus-5` inside `build_llm`.
+That has been pulled out into a registry keyed by provider name, holding the only four
+things that actually differ between vendors: the integration package, the class inside
+it, the credential variable, and what that vendor calls the output cap. Seven providers
+ship — anthropic, openai, google, mistral, groq for hosted models, and ollama plus
+openai_compatible for open weights (vLLM, llama.cpp, LM Studio, TGI, OpenRouter).
+
+Three design calls worth recording:
+
+- **No default provider.** An unset `SIBYL_LLM_PROVIDER` raises. A default would make
+  one vendor the quiet norm and every other one opt-in, which is the exact asymmetry
+  the refactor removes — and it would fire a request at a paid endpoint nobody chose.
+- **`temperature` is not in the signature.** It looks portable and is not: current
+  Anthropic models reject it with a 400. It goes through `**kwargs` with every other
+  vendor-specific knob, so the shared signature only contains genuinely shared things.
+- **Open weights are not a special case.** `ollama` and `openai_compatible` reuse the
+  same registry rows and the same code path as the hosted vendors. The only difference
+  is `api_key_env=None` and a default `base_url`.
+
+`_text_of` was also generalised. It stripped blocks of type `thinking` — one vendor's
+spelling. It now strips `reasoning` and `reasoning_content` too, and falls back to any
+non-reasoning block rather than returning an empty answer when no block self-identifies
+as text.
+
+**Thirty-two tests**, none of which construct a real client, so they run in CI with no
+provider package installed. Separately and outside CI, `anthropic`, `ollama` and
+`openai_compatible` were each constructed for real to confirm the per-vendor argument
+names are right — that check is what proves `max_tokens` vs `max_output_tokens` vs
+`num_predict` is correct rather than plausible.
+
+One test here initially passed for the wrong reason, in the same family as the stub-id
+bug above: it asserted that building an `ollama` model raises `ImportError`, which held
+only because `langchain_ollama` happened to be absent. Installing the package broke it.
+It now stubs the import and asserts the thing actually under test — that a self-hosted
+provider clears the credential gate with no key set.
+
+### 10. The agent has now run for real
+
+Eight runs against `qwen2.5:7b` on a local Ollama daemon — free, no account, and the
+first time any of this executed outside a stub. Two fixtures: **A**, 500 daily points
+with a weekly cycle and 5 NaNs (prophet is correct); **B**, 60 monthly points, which
+is below prophet's stated floor of 100 (ETS is correct).
+
+The first run failed outright and usefully. Four distinct defects, all real:
+
+| Defect | Fix | Where |
+|---|---|---|
+| Skipped `list_models` and `run_forecast`, answered anyway | Ordered steps made explicit; "you have not answered until `run_forecast` has run" | prompt |
+| Chose **ARIMA**, which does not exist | `list_models` named as the only source of truth | prompt |
+| Chose prophet on 60 points, quoting the 100 floor while ignoring it | Tool now **refuses** below the floor and names the models that fit | code |
+| Reported a `[-inf, inf]` interval as a normal result | Tool now says the interval is infinite and why | code |
+
+The split matters. The two prompt fixes ask a model to behave; the two code fixes
+hold for every model regardless of capability, which is the right place for anything
+load-bearing. The sample floor especially: it was advertised on every `ModelCard` and
+enforced by nothing — `ProphetForecaster.fit()` will fit 60 points against its own
+stated minimum of 100 without complaint. The card was documentation pretending to be
+a contract.
+
+**Result after the fixes**, over six further runs:
+
+| Fixture | Tool calls needed | Outcome |
+|---|---|---|
+| A | 3 (diagnose → list_models → run_forecast) | correct, ~2 runs in 3 |
+| B | 4 (the above, plus a retry after the refusal) | **0 in 6** |
+
+Scenario B fails the same way every time, and not for want of understanding: the
+refusal lands, the model reasons correctly to ETS, and then *describes* calling
+`run_forecast` in prose instead of emitting a tool call. Making the refusal name the
+eligible models and end in an imperative did not shift it. The conclusion is a
+capability ceiling, not a prompt defect — **qwen2.5:7b cannot chain a fourth tool call
+after a tool error** — and further prompt work against a 7B model is not the way to
+close it. The recovery path itself is sound and deterministically covered by tests.
+
+Worth recording for anyone choosing a model: the first attempt used
+`qwen2.5-coder:7b`, which advertises `tools` capability in Ollama and does not
+usefully have it — it emits `{"name": ..., "arguments": ...}` as message text with
+`tool_calls=[]`, on a one-tool prompt with no other context. Declared capability is
+not evidence; a two-line probe is.
 
 ---
 
@@ -217,10 +324,13 @@ not run away. The stub now mints a fresh id per reply.
 
 **Not yet verified:**
 
-- **The agent has never made a real Claude call.** The graph, tools and result
-  plumbing are covered; the live round-trip is not. Expect to iterate on the system
-  prompt the first time it runs for real. This is the single largest gap in the
-  project's verification.
+- **No hosted provider has been called.** The live verification below used a local
+  `ollama` model only. Nothing has exercised Anthropic, OpenAI, Google, Mistral or
+  Groq end to end, so their registry rows are verified as far as constructing a
+  client and binding tools, and no further.
+- **Scenario B has never completed on the model available.** See below — it is a
+  model limit rather than a code one, but it means the tool-error recovery path is
+  proven only against the stub, never live.
 
 **Known limitations, unchanged:**
 
@@ -239,11 +349,13 @@ not run away. The stub now mints a fresh id per reply.
 
 **Next up, in order:**
 
-1. Run the agent once against the real API and tune the system prompt on what comes
-   back.
-2. Commit and push the agent layer; confirm CI stays green with the `[agents]` extra
-   installed.
-3. Then tasks / persistence, each with its extra promoted as it lands.
+1. Run the agent against a local `ollama` model first — free, no account, and it
+   shakes out prompt and tool-calling problems before any paid call. Then run a hosted
+   provider and compare.
+2. Tune the system prompt on what comes back, and decide whether one prompt serves
+   every provider or whether the weaker ones need their own.
+3. Commit and push; confirm CI stays green with `[agents]` and no provider installed.
+4. Then tasks / persistence, each with its extra promoted as it lands.
 
 ---
 
@@ -261,6 +373,11 @@ not run away. The stub now mints a fresh id per reply.
 - **The architecture anticipated its own consumers.** `ModelCard` was designed before
   any agent existed, with a docstring naming exactly what would read it. When the agent
   was built, the interface it needed was already there and unchanged.
+- **The agent's seam was in the right place already.** `run_agent(..., llm=...)` took
+  an injected model from the start, purely so tests could pass a stub. That one
+  parameter is why making the agent provider-agnostic touched a single function and no
+  graph code: the abstraction the refactor needed had been sitting there since the
+  layer was written, for an unrelated reason.
 - **The tests were doing their job the whole time.** They found four real bugs on their
   first ever execution. Nothing was listening — which is the entire lesson of this
   repository's first ten commits, and the reason fixing one line in `pyproject.toml`

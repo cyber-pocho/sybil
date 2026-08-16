@@ -18,11 +18,16 @@ stops reaching for tools, which is its way of saying it has an answer.
 Tools close over one series rather than taking it as an argument: a DataFrame
 cannot survive a round trip through a JSON tool call, and passing an opaque
 handle would just move the closure somewhere less obvious.
+
+Nothing in this module names a model vendor. The agent needs a chat model that
+can call tools; which one, and whether its weights are open, is decided in
+llm.py and injectable here for tests.
 """
 
 from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
 import pandas as pd
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.tools import StructuredTool
@@ -36,6 +41,7 @@ from forecasting.conformal import ConformalWrapper
 from forecasting.ets_model import ETSForecaster
 from forecasting.prophet_model import ProphetForecaster
 from forecasting.schemas import ForecastResult
+from sibyl.agents.llm import bind_tools, build_llm  # noqa: F401  (build_llm re-exported)
 
 # Model registry. Adding a forecaster here is all it takes for the agent to
 # consider it — the card supplies the description the LLM reasons over.
@@ -44,19 +50,32 @@ _MODELS: dict[str, type[BaseForecaster]] = {
     "ets":     ETSForecaster,
 }
 
+# Tuned against the weakest model the agent supports — a 7B local one — because a
+# prompt that holds there holds everywhere. Each rule below exists because the
+# first live run broke it: the model skipped straight to an answer, named a
+# forecaster that does not exist, ignored a card's sample floor, and reported an
+# infinite interval as though it were a result.
 _SYSTEM_PROMPT = """You are a time-series forecasting analyst.
 
-Your job, in order:
-1. Call `diagnose` to understand the series before touching a model.
-2. Call `list_models` to see what is available and what each one is suited to.
-3. Call `run_forecast` exactly once, with the model whose card best matches the
-   diagnosis. Wrap it in conformal intervals when the model's native intervals
-   rest on assumptions the diagnosis contradicts.
-4. Reply with two or three sentences: which model you chose and which specific
-   findings in the diagnosis led you there. Cite the numbers you saw.
+Work in this order, and do not skip a step:
+1. Call `diagnose`. Never choose a model before you have read its output.
+2. Call `list_models`. It is the only source of truth for which models exist and
+   what each one needs — never name a model it did not return.
+3. Call `run_forecast` exactly once, with the model whose card best fits the
+   diagnosis.
+4. Only then reply, in two or three sentences: which model you ran, and which
+   numbers from the diagnosis led you there.
 
-Choose on evidence from the diagnosis, not on model popularity. If the series
-has missing values, prefer a model whose card says it handles them."""
+Reading the cards:
+- `minimum samples` is a hard floor. A series shorter than it rules that model
+  out, however well the rest of the card fits.
+- `handles missing values` matters only when the diagnosis reports some.
+- Conformal intervals hold back part of the history to calibrate, so they need
+  roughly twice a model's minimum samples. Below that they widen to infinity and
+  tell the user nothing — leave `conformal` false when history is short.
+
+You have not answered until `run_forecast` has run. A reply naming a model
+without forecasting is a failed answer."""
 
 
 @dataclass
@@ -68,22 +87,6 @@ class AgentRun:
     forecast: ForecastResult | None = None        # None if it never forecast
     model_used: str | None = None
     messages: list[Any] = field(default_factory=list)   # full transcript, for debugging
-
-
-def build_llm(model: str = "claude-opus-5", max_tokens: int = 8192):
-    """Claude with adaptive thinking — the model decides how much to think per call.
-
-    Model selection is a judgement call over several competing signals, which is
-    exactly the shape of problem adaptive thinking is for. Imported lazily so the
-    rest of this module stays importable without the Anthropic dependency.
-    """
-    from langchain_anthropic import ChatAnthropic
-
-    return ChatAnthropic(
-        model=model,
-        max_tokens=max_tokens,
-        thinking={"type": "adaptive"},
-    )
 
 
 # ── tools ─────────────────────────────────────────────────────────────────────
@@ -145,6 +148,31 @@ def _build_tools(series: pd.Series, run: AgentRun) -> list[StructuredTool]:
         if conformal:
             model = ConformalWrapper(model)
 
+        # The cards advertise a sample floor that no forecaster actually enforces:
+        # ProphetForecaster.fit() will fit 60 points against its own stated minimum
+        # of 100 without complaint. The first live run showed a model reading that
+        # floor, naming it out loud, and fitting anyway — so enforce it here rather
+        # than hope the prompt holds for every model anyone plugs in. Returned like
+        # the unknown-model case, not raised, so the agent can choose again.
+        usable = int(series.notna().sum())
+        floor = model.card.min_samples_required
+        if usable < floor:
+            # Name the models that do fit rather than asking the caller to re-derive
+            # them. The registry already knows, and live runs showed a 7B model
+            # reasoning its way to the right alternative and then describing the
+            # call instead of making it — every step removed is a step it cannot
+            # fumble. The closing imperative is aimed at the same weakness.
+            fits = sorted(
+                name for name, cls in _MODELS.items()
+                if cls().card.min_samples_required <= usable
+            )
+            return (
+                f"Refused: {model.card.name} needs at least {floor} usable observations "
+                f"and this series has {usable}. "
+                + (f"Models that fit: {', '.join(fits)}. " if fits else "No model fits. ")
+                + "Call `run_forecast` again now with one of them. Do not answer until it runs."
+            )
+
         model.fit(series)
         result = model.predict(horizon)
 
@@ -152,12 +180,24 @@ def _build_tools(series: pd.Series, run: AgentRun) -> list[StructuredTool]:
         run.model_used = result.model_name
 
         first, last = result.point_forecast[0], result.point_forecast[-1]
-        return (
+        summary = (
             f"Fitted {result.model_name} in {result.fit_time_seconds}s. "
             f"{horizon}-step forecast runs from {first:.1f} to {last:.1f}, "
             f"with a 95% interval of [{result.lower_95[-1]:.1f}, {result.upper_95[-1]:.1f}] "
             f"at the final step."
         )
+
+        # An infinite interval is the honest answer to too little calibration data
+        # — ConformalWrapper widens rather than under-cover — but it is useless to
+        # a caller, and a model reading this string will otherwise repeat it as a
+        # normal result. Name the problem and the fix instead of leaving "[-inf,
+        # inf]" to speak for itself.
+        if not np.isfinite([result.lower_95[-1], result.upper_95[-1]]).all():
+            summary += (
+                " That interval is infinite: the calibration split was too small to bound "
+                "this level. Re-run with conformal=false, or use a longer series."
+            )
+        return summary
 
     # from_function reads the name, docstring and type hints to build the schema
     # the LLM sees — so the docstrings above are the tool descriptions.
@@ -168,7 +208,7 @@ def _build_tools(series: pd.Series, run: AgentRun) -> list[StructuredTool]:
 
 def build_graph(llm, tools: list[StructuredTool]):
     """Wire the two-node ReAct loop and compile it."""
-    llm_with_tools = llm.bind_tools(tools)
+    llm_with_tools = bind_tools(llm, tools)
 
     def call_model(state: MessagesState) -> dict:
         return {"messages": [llm_with_tools.invoke(state["messages"])]}
@@ -195,8 +235,9 @@ def run_agent(
         series:          observations with a DatetimeIndex — the same contract
                          BaseForecaster.fit() expects.
         horizon:         steps to forecast.
-        llm:             any tool-calling chat model. Defaults to Claude; inject a
-                         stub to run the graph without network access.
+        llm:             any tool-calling chat model, from any provider. Defaults
+                         to whatever SIBYL_LLM_PROVIDER / SIBYL_LLM_MODEL select;
+                         inject a stub to run the graph without network access.
         recursion_limit: hard ceiling on agent↔tools round trips, so a model that
                          keeps calling tools cannot loop forever.
     """
@@ -232,16 +273,29 @@ def run_agent(
     return run
 
 
-def _text_of(message: AIMessage) -> str:
-    """Flatten message content to plain text.
+# Block types that carry a model's private reasoning rather than its answer.
+# Vendors each picked their own spelling; the agent must never surface any of them.
+_REASONING_BLOCKS = {"thinking", "redacted_thinking", "reasoning", "reasoning_content"}
 
-    With thinking enabled the content is a list of blocks rather than a string,
-    and the thinking blocks are not the answer — keep only the text ones.
+
+def _text_of(message: AIMessage) -> str:
+    """Flatten message content to plain text, whatever shape the provider chose.
+
+    Providers disagree here. Most return a plain string. Ones with reasoning
+    turned on return a list of typed blocks, where the reasoning blocks are not
+    the answer and must be dropped.
     """
     if isinstance(message.content, str):
         return message.content
+
+    blocks = [b for b in message.content if isinstance(b, dict)]
+    text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip()
+    if text:
+        return text
+
+    # Nothing announced itself as a text block. Rather than return an empty
+    # answer, accept any block carrying text — except the reasoning ones, which
+    # are the whole reason this function exists.
     return "".join(
-        block.get("text", "")
-        for block in message.content
-        if isinstance(block, dict) and block.get("type") == "text"
+        b.get("text", "") for b in blocks if b.get("type") not in _REASONING_BLOCKS
     ).strip()

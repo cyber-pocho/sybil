@@ -1,12 +1,16 @@
 """
 Tests for the LangGraph forecasting agent.
 
-The LLM is stubbed. A real Claude call would make these tests non-deterministic,
-slow, and dependent on ANTHROPIC_API_KEY being set in CI — none of which tells us
-anything about the graph. What we actually want to know is that the wiring holds:
-tools fire in the order the model asks for, results land in AgentRun, and the loop
-terminates. StubChatModel replays a fixed script of AIMessages to pin all of that
-down.
+The LLM is stubbed. A real call to any provider would make these tests
+non-deterministic, slow, and dependent on that vendor's credential being set in
+CI — none of which tells us anything about the graph. What we actually want to
+know is that the wiring holds: tools fire in the order the model asks for,
+results land in AgentRun, and the loop terminates. StubChatModel replays a fixed
+script of AIMessages to pin all of that down.
+
+The stub is also the honest model of what the agent requires. It implements the
+chat interface and bind_tools and nothing else, which is exactly the contract
+llm.py hands over — so anything passing here works on any provider that meets it.
 """
 
 import numpy as np
@@ -141,6 +145,81 @@ def test_conformal_flag_is_honoured(series):
     assert run.model_used == "conformal(ets)"
 
 
+# ── the card's sample floor is enforced, not merely advertised ────────────────
+
+@pytest.fixture(scope="module")
+def short_series() -> pd.Series:
+    """60 monthly points: above ETS's floor of 24, below prophet's of 100."""
+    n = 60
+    return pd.Series(
+        500.0 + 2.5 * np.arange(n) + RNG.normal(0, 8.0, n),
+        index=pd.date_range("2021-01-31", periods=n, freq="ME"),
+    )
+
+
+def test_model_below_its_sample_floor_is_refused(short_series):
+    # No forecaster enforces its own card, so the tool has to. The first live run
+    # showed a model quoting prophet's 100-sample minimum and fitting 60 anyway.
+    llm = StubChatModel(replies=[
+        _tool_call("run_forecast", {"model_name": "prophet", "horizon": 12}, "c1"),
+        AIMessage(content="unused"),
+    ])
+    run = run_agent(short_series, horizon=12, llm=llm)
+
+    refusal = run.messages[3].content
+    assert run.forecast is None
+    assert "Refused" in refusal
+    assert "at least 100" in refusal
+    # The refusal must name the way out, not just the problem.
+    assert "Models that fit: ets" in refusal
+
+
+def test_refusal_is_recoverable(short_series):
+    # Same shape as the unknown-model path: the agent is told, and picks again.
+    llm = StubChatModel(replies=[
+        _tool_call("run_forecast", {"model_name": "prophet", "horizon": 12}, "c1"),
+        _tool_call("run_forecast", {"model_name": "ets", "horizon": 12}, "c2"),
+        AIMessage(content="Prophet needs 100 points; used ETS."),
+    ])
+    run = run_agent(short_series, horizon=12, llm=llm)
+    assert run.model_used == "ets"
+
+
+def test_model_above_its_floor_is_fitted(series):
+    llm = StubChatModel(replies=[
+        _tool_call("run_forecast", {"model_name": "prophet", "horizon": 5}, "c1"),
+        AIMessage(content="ok"),
+    ])
+    assert run_agent(series, horizon=5, llm=llm).model_used == "prophet"
+
+
+# ── a degenerate interval is called out, not reported as a result ─────────────
+
+def test_infinite_conformal_interval_is_flagged_to_the_model():
+    """A short series leaves too few calibration points to bound 95%.
+
+    ConformalWrapper correctly returns infinite width rather than under-covering,
+    but "[-inf, inf]" reads like a normal number to a model summarising the tool
+    result — the first live run repeated it as though it were a finding. The tool
+    now says what went wrong and what to do about it.
+    """
+    n = 60
+    short = pd.Series(
+        500.0 + 2.5 * np.arange(n) + RNG.normal(0, 8.0, n),
+        index=pd.date_range("2021-01-31", periods=n, freq="ME"),
+    )
+    llm = StubChatModel(replies=[
+        _tool_call("run_forecast", {"model_name": "ets", "horizon": 12, "conformal": True}, "c1"),
+        AIMessage(content="done"),
+    ])
+    run = run_agent(short, horizon=12, llm=llm)
+
+    # system, human, tool-call turn, tool result, answer
+    tool_result = run.messages[3].content
+    assert "interval is infinite" in tool_result
+    assert "conformal=false" in tool_result
+
+
 # ── a bad tool argument is recoverable, not fatal ──────────────────────────────
 
 def test_unknown_model_returns_error_string_and_agent_recovers(series):
@@ -186,15 +265,23 @@ def test_recursion_limit_stops_a_looping_model(series):
         run_agent(series, llm=llm, recursion_limit=6)
 
 
-# ── thinking blocks are not the answer ────────────────────────────────────────
+# ── reasoning blocks are not the answer, whichever vendor emitted them ────────
 
-def test_thinking_blocks_stripped_from_explanation(series):
-    # With adaptive thinking the content is a block list, not a string
+@pytest.mark.parametrize("reasoning_type", ["thinking", "redacted_thinking", "reasoning"])
+def test_reasoning_blocks_stripped_from_explanation(series, reasoning_type):
+    # A reasoning model returns a list of blocks rather than a string, and each
+    # vendor picked its own name for the private ones. None may reach the user.
     llm = StubChatModel(replies=[AIMessage(content=[
-        {"type": "thinking", "thinking": "internal reasoning the user must not see"},
+        {"type": reasoning_type, "text": "internal reasoning the user must not see"},
         {"type": "text", "text": "ETS fits this series best."},
     ])])
     run = run_agent(series, llm=llm)
 
     assert run.explanation == "ETS fits this series best."
     assert "internal reasoning" not in run.explanation
+
+
+def test_plain_string_content_is_passed_through(series):
+    # The common case: a provider with no reasoning blocks at all.
+    llm = StubChatModel(replies=[AIMessage(content="Prophet, for the weekly cycle.")])
+    assert run_agent(series, llm=llm).explanation == "Prophet, for the weekly cycle."

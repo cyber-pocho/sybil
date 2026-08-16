@@ -13,7 +13,7 @@ Sibyl ingests raw time-series DataFrames and runs a layered diagnostic suite: pr
 | Diagnosis (`src/diagnosis/`) | ✅ Implemented, fully covered |
 | Forecasting (`src/forecasting/`) | ✅ Prophet, ETS, split-conformal intervals |
 | HTTP API (`src/sibyl/api/`) | 🟡 `/health` and `/diagnose` only |
-| Agent (`src/sibyl/agents/`) | ✅ LangGraph model-selection agent |
+| Agent (`src/sibyl/agents/`) | ✅ LangGraph model-selection agent, any LLM provider |
 | Tasks, persistence, vector search | ⛔ Not started — empty packages |
 
 ## Project layout
@@ -36,7 +36,8 @@ src/
 └── sibyl/              # Application layer
     ├── api/app.py      # FastAPI factory — the service entry point
     ├── agents/
-    │   └── forecaster_agent.py  # LangGraph agent: diagnose → pick a model → explain
+    │   ├── forecaster_agent.py  # LangGraph agent: diagnose → pick a model → explain
+    │   └── llm.py               # Provider registry — the only file naming a vendor
     ├── services/       # Business logic        (empty)
     ├── tasks/          # Celery workers        (empty)
     ├── models/         #                       (empty)
@@ -45,9 +46,12 @@ src/
 tests/
 ├── unit/               # Per-module tests; the agent runs against a stub LLM
 └── integration/        # End-to-end run_full_diagnosis coverage
+
+scripts/
+└── run_agent_live.py   # Run the agent against a real model, any provider
 ```
 
-172 tests, no skips. `ruff check` clean.
+211 tests, no skips. `ruff check` clean.
 
 ## Diagnostic pipeline
 
@@ -173,14 +177,109 @@ The graph is the standard two-node ReAct loop — `START → agent ⇄ tools →
 with three tools: `diagnose`, `list_models`, and `run_forecast`. It runs until the
 model stops calling tools, bounded by `recursion_limit`.
 
-Defaults to **Claude Opus 5** (`claude-opus-5`) with adaptive thinking, so the model
-decides how much to reason per call. Set `ANTHROPIC_API_KEY` to run it. Any
-tool-calling chat model can be injected instead via `run_agent(..., llm=...)` — the
-test suite passes a stub, which is why CI needs no API key.
+`run_forecast` refuses a model whose `ModelCard.min_samples_required` exceeds the
+usable history, naming the models that do fit. The floor was advertised on every card
+and enforced by nothing — `ProphetForecaster.fit()` will fit 60 points against its own
+stated minimum of 100 — so a live model read the number, said it out loud, and fitted
+anyway. Refusals return as text rather than raising, so the agent picks again instead
+of aborting the graph.
 
-⚠️ The graph, the tools, and the result plumbing are covered by tests against that
-stub. The live Claude round-trip is **not** yet exercised — no run against the real
-API has happened. Expect to iterate on the system prompt the first time you do.
+Run it yourself against any provider:
+
+```bash
+SIBYL_LLM_PROVIDER=ollama SIBYL_LLM_MODEL=qwen2.5:7b python scripts/run_agent_live.py
+```
+
+Two fixtures that discriminate on different card fields — one on `handles_missing`,
+one on `min_samples_required` — plus the full transcript and token counts.
+
+### Choosing a model
+
+The agent is provider-agnostic. It asks two things of a model — that it speaks the
+LangChain chat interface, and that it can call tools — and nothing else. Closed or
+open weights, hosted or on your own machine, it is the same code path.
+
+Pick a provider with two environment variables:
+
+```bash
+pip install -e ".[agents,anthropic]"        # or openai / google / mistral / groq / ollama
+export SIBYL_LLM_PROVIDER=anthropic
+export SIBYL_LLM_MODEL=claude-opus-5
+export ANTHROPIC_API_KEY=sk-ant-...
+```
+
+| `SIBYL_LLM_PROVIDER` | Extra | Credential | Example model |
+|---|---|---|---|
+| `anthropic` | `[anthropic]` | `ANTHROPIC_API_KEY` | `claude-opus-5` |
+| `openai` | `[openai]` | `OPENAI_API_KEY` | `gpt-5` |
+| `google` | `[google]` | `GOOGLE_API_KEY` | `gemini-2.5-pro` |
+| `mistral` | `[mistral]` | `MISTRAL_API_KEY` | `mistral-large-latest` |
+| `groq` | `[groq]` | `GROQ_API_KEY` | `llama-3.3-70b-versatile` |
+| `ollama` | `[ollama]` | *none* | `llama3.1:8b` |
+| `openai_compatible` | `[openai]` | *usually none* | whatever your server serves |
+
+`ollama` runs open weights locally. `openai_compatible` covers anything exposing an
+OpenAI-shaped `/v1` endpoint — vLLM, llama.cpp's server, LM Studio, TGI, OpenRouter,
+Together — via `SIBYL_LLM_BASE_URL`:
+
+```bash
+export SIBYL_LLM_PROVIDER=openai_compatible
+export SIBYL_LLM_MODEL=Qwen/Qwen2.5-7B-Instruct
+export SIBYL_LLM_BASE_URL=http://localhost:8000/v1
+```
+
+**There is no default provider.** An unset `SIBYL_LLM_PROVIDER` raises rather than
+quietly sending a request to somebody's paid endpoint. Vendor-specific settings go
+through `**kwargs`, which is also how a model gets anything the registry is too
+small to know about:
+
+```python
+from sibyl.agents.llm import build_llm
+
+llm = build_llm("anthropic", "claude-opus-5", thinking={"type": "adaptive"})
+llm = build_llm("ollama", "llama3.1:8b", num_ctx=8192)
+run = run_agent(series, horizon=30, llm=llm)
+```
+
+Adding a provider is one row in `_PROVIDERS` (`src/sibyl/agents/llm.py`) plus one
+line in `pyproject.toml`. Nothing in `forecaster_agent.py` changes.
+
+### Picking a model that can actually do this
+
+**Tool calling is required, not optional** — the loop *is* the model choosing tools.
+The agent needs three calls minimum, and four when it has to recover from a tool
+error, so a model that tool-calls *sometimes* is not enough.
+
+Measured on `qwen2.5:7b` over eight local runs:
+
+| Path | Calls | Success |
+|---|---|---|
+| diagnose → list_models → run_forecast | 3 | ~2 in 3 |
+| the above, plus a retry after a refusal | 4 | **0 in 6** |
+
+It reasons correctly on the failing path and then *describes* the tool call in prose
+instead of making one. Treat ~7B as good enough to smoke-test the wiring and not for
+production; use a frontier hosted model, or a considerably larger local one, for real
+work.
+
+Declared capability is not evidence. `qwen2.5-coder:7b` advertises `tools` in Ollama
+and returns `tool_calls=[]` with the JSON as text. Probe before trusting it:
+
+```python
+from langchain_ollama import ChatOllama
+from langchain_core.tools import StructuredTool
+
+def get_weather(city: str) -> str:
+    """Get the current weather for a city."""
+    return "sunny"
+
+llm = ChatOllama(model="<your model>").bind_tools([StructuredTool.from_function(get_weather)])
+print(llm.invoke("Weather in Paris? Use the tool.").tool_calls)   # must be non-empty
+```
+
+⚠️ The agent has run end to end against a **local Ollama model only**. The hosted
+providers are verified as far as constructing a client and binding tools — no live
+round-trip. Run `scripts/run_agent_live.py` against yours before trusting it.
 
 ## HTTP API
 
@@ -211,7 +310,8 @@ Core install is the numeric stack only. Everything else is an extra, so profilin
 | Forecasting | Prophet, statsmodels | *(core)* | in use |
 | Schemas | Pydantic v2 | *(core)* | in use |
 | API | FastAPI, uvicorn | `[api]` | in use |
-| Agent | LangGraph, langchain-anthropic | `[agents]` | in use |
+| Agent | LangGraph, langchain-core | `[agents]` | in use |
+| LLM provider | one of langchain-{anthropic,openai,google-genai,mistralai,groq,ollama} | `[anthropic]` … `[ollama]` | in use, pick one |
 | Vector search | FAISS, sentence-transformers, PyTorch | `[vectorsearch]` | planned |
 | Task queue | Celery + Redis | `[workers]` | planned |
 | Database | SQLAlchemy, asyncpg, Alembic | `[db]` | planned |
@@ -223,8 +323,11 @@ Dependencies carry upper version bounds. This is deliberate: an unpinned `mapie`
 ## Getting started
 
 ```bash
-# Install (core + dev tools + API + agent)
+# Install (core + dev tools + API + agent, no model provider)
 make install          # pip install -e ".[dev,api,agents]"
+
+# Add whichever provider you intend to use
+pip install -e ".[anthropic]"   # or openai / google / mistral / groq / ollama
 
 # Run tests
 make test             # pytest → tests/unit + tests/integration
@@ -241,12 +344,22 @@ make docker-up        # api + redis + postgres
 
 ## Environment variables
 
-`.env.example` lists the variables the planned layers will need (`ANTHROPIC_API_KEY`, `DATABASE_URL`, `REDIS_URL`, `WANDB_API_KEY`, `STRIPE_SECRET_KEY`, `FAISS_INDEX_PATH`).
+`.env.example` lists them all.
 
-`ANTHROPIC_API_KEY` is read by the agent (via `langchain-anthropic`) when you run it
-against real Claude; the rest are not read by any code today. `.env` stays optional —
-the API and `docker compose up` both start without one.
+Read by the agent today:
+
+| Variable | Purpose |
+|---|---|
+| `SIBYL_LLM_PROVIDER` | which provider to build a model from — no default |
+| `SIBYL_LLM_MODEL` | the vendor's own model id |
+| `SIBYL_LLM_MAX_TOKENS` | optional output cap, mapped to each vendor's own name |
+| `SIBYL_LLM_BASE_URL` | endpoint for `openai_compatible`; optional for `ollama` |
+| `<PROVIDER>_API_KEY` | the credential for the provider you chose, if it needs one |
+
+Not read by any code yet: `DATABASE_URL`, `REDIS_URL`, `WANDB_API_KEY`,
+`STRIPE_SECRET_KEY`, `FAISS_INDEX_PATH`. `.env` stays optional — the API and
+`docker compose up` both start without one.
 
 ## CI
 
-GitHub Actions runs on every push to `main` and all PRs: `ruff check src/ tests/`, then `pytest tests/ -v` across both the unit and integration suites. The agent tests run against a stub LLM, so no API key is needed. `make lint` runs the identical lint command, so a green local run means a green CI run.
+GitHub Actions runs on every push to `main` and all PRs: `ruff check src/ tests/`, then `pytest tests/ -v` across both the unit and integration suites. CI installs `[dev,api,agents]` and **no provider package at all** — the agent tests run against a stub LLM, so no vendor credential is needed, and a green CI run is itself the evidence that the agent core carries no vendor dependency. `make lint` runs the identical lint command, so a green local run means a green CI run.

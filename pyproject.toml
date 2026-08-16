@@ -37,15 +37,35 @@ api = [
     "uvicorn[standard]>=0.27,<1",
 ]
 
-# LangGraph agent that picks a forecasting model and explains the choice.
-# Only what src/sibyl/agents/ actually imports — the vector-search stack that
-# used to live here moved to [vectorsearch], so installing the agent no longer
-# pulls in torch.
+# The agent graph. Provider-neutral by construction: langgraph runs the loop,
+# langchain-core defines the message and tool interfaces, and neither one knows
+# which vendor is behind the model. Installing this gets you the agent without
+# committing to a provider — pick one from the extras below.
+#
+# The ceilings say <2, not <1. The previous <1 pins predated LangChain's 1.0
+# release and had quietly become the opposite of what a ceiling is for: instead
+# of guarding against a breaking change, they excluded every current release and
+# held the project on an end-of-life major. The suite passes unmodified on 1.x.
 agents = [
-    "langgraph>=0.6,<1",
-    "langchain-core>=0.3,<1",
-    "langchain-anthropic>=0.3,<1",
+    "langgraph>=1.0,<2",
+    "langchain-core>=1.0,<2",
 ]
+
+# Model providers. Install whichever one SIBYL_LLM_PROVIDER points at:
+#
+#     pip install -e ".[agents,openai]"
+#
+# The agent treats them identically — they differ only in which package supplies
+# the LangChain integration, which is the whole point of src/sibyl/agents/llm.py.
+# For open weights: [ollama] runs them locally, and [openai] also covers every
+# server that speaks an OpenAI-shaped /v1 endpoint (vLLM, llama.cpp, LM Studio,
+# TGI, OpenRouter, Together) via provider 'openai_compatible'.
+anthropic = ["langchain-anthropic>=1.0,<2"]
+openai    = ["langchain-openai>=1.0,<2"]
+google    = ["langchain-google-genai>=4.0,<5"]
+mistral   = ["langchain-mistralai>=1.0,<2"]
+groq      = ["langchain-groq>=1.0,<2"]
+ollama    = ["langchain-ollama>=1.0,<2"]
 
 # Semantic retrieval over past forecasts — not yet implemented.
 vectorsearch = [
