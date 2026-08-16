@@ -16,7 +16,7 @@ Sibyl ingests raw time-series DataFrames and runs a layered diagnostic suite: pr
 | Agent (`src/sibyl/agents/`) | ✅ LangGraph model-selection agent, any LLM provider |
 | Tasks (`src/sibyl/tasks/`) | ✅ Celery worker running forecast jobs |
 | Persistence (`src/sibyl/db/`, `models/`) | ✅ SQLAlchemy + Alembic, one `jobs` table |
-| Vector search | ⛔ Not started — empty package |
+| Vector search | ⛔ Not started — only the `[vectorsearch]` extra exists |
 
 ## Project layout
 
@@ -323,6 +323,10 @@ make run-api        # the API
 make run-worker     # celery -A sibyl.tasks.celery_app worker
 ```
 
+Both processes must run the same schema, so migrate first. Neither one migrates on
+startup: doing that automatically means two processes racing the same DDL on every
+deploy, and a migration is a decision, not a side effect of booting.
+
 ```bash
 curl -X POST localhost:8000/forecast \
   -H 'Content-Type: application/json' \
@@ -394,6 +398,10 @@ make run-worker       # celery -A sibyl.tasks.celery_app worker
 
 # Start the stack
 make docker-up        # api + worker + redis + postgres
+
+# Compose does not migrate on boot — nothing creates the schema for you, and
+# /forecast will fail on a missing table until you run this once:
+docker compose exec api alembic upgrade head
 ```
 
 ## Environment variables
@@ -423,4 +431,9 @@ start without one.
 
 ## CI
 
-GitHub Actions runs on every push to `main` and all PRs: `ruff check src/ tests/`, then `pytest tests/ -v` across both the unit and integration suites. CI installs `[dev,api,agents]` and **no provider package at all** — the agent tests run against a stub LLM, so no vendor credential is needed, and a green CI run is itself the evidence that the agent core carries no vendor dependency. `make lint` runs the identical lint command, so a green local run means a green CI run.
+GitHub Actions runs on every push to `main` and all PRs: `ruff check src/ tests/ scripts/ alembic/`, then `pytest tests/ -v` across both the unit and integration suites. `make lint` runs the identical lint command, so a green local run means a green CI run.
+
+CI installs `[dev,api,agents,db,workers]` and **no provider package at all**. That is deliberate on both counts:
+
+- The agent tests run against a stub LLM, so no vendor credential is needed — and a green CI run is itself the evidence that the agent core carries no vendor dependency.
+- The worker tests call `run_forecast_job` directly and SQLite stands in for Postgres, so no broker and no database server are needed either. Celery's own message delivery is the one thing CI does not cover; it is verified by hand against a real Redis and Postgres instead.

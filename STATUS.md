@@ -1,9 +1,11 @@
 # Sibyl — Project Status Report
 
 **Date:** 2026-08-16
-**Branch:** `agent/provider-agnostic` @ `ff33629` + uncommitted tasks/persistence layer
-**Basis:** full read-through, plus clean-room install / lint / test, a Docker build and
-container probe, and the GitHub Actions history
+**Branch:** `agent/provider-agnostic` @ `c56e45e`, pushed; not yet merged to `main`
+**Basis:** full read-through, plus clean-room installs at three dependency levels,
+lint, the test suite, Alembic against SQLite and real Postgres, a live agent run
+against a local model, a real Redis/Celery/Postgres job round trip, a Docker build
+and full `docker compose` probe, and the GitHub Actions history
 
 ---
 
@@ -40,7 +42,7 @@ Everything below was executed, not inferred.
 | `alembic upgrade head` → **real Postgres 16** | ✅ table + index as designed |
 | Real Redis + real Celery worker + real Postgres round trip | ✅ 202 → queued → `done` with a forecast |
 | Same, for a job that fails | ✅ recorded as `failed` with the reason; worker survived |
-| Agent live against local `qwen2.5:7b` | ✅ ran; see §10 for what it found |
+| Agent live against local `qwen2.5:7b` | ✅ ran; see "What the first live runs found" |
 | `docker build` → `docker compose up` → full job round trip | ✅ 1.08 GB image; migrate, POST, worker, poll, `done` |
 
 | Metric | Before (`0fb8648`) | Now |
@@ -78,7 +80,7 @@ Everything below was executed, not inferred.
 | `sibyl/models/job.py` | 62 | — | ✅ one table, JSON params and result |
 | `sibyl/db/{engine,base}.py` | 88 | — | ✅ sync engine, lazily built |
 | `sibyl/tasks/{celery_app,forecast}.py` | 105 | 11 | ✅ verified against a real broker |
-| `sibyl/vectorsearch` | 0 | — | ⛔ not started |
+| Vector search | — | — | ⛔ not started; no package exists, only the `[vectorsearch]` extra |
 
 ---
 
@@ -205,13 +207,53 @@ under uvicorn and inside the container.
 | File | Was | Now |
 |---|---|---|
 | `Makefile` | `sibyl.api.main:app` | `sibyl.api.app:create_app --factory` |
-| `Dockerfile` | `src.api.app:create_app` | same, plus `[api]` extra and `PYTHONPATH` |
-| `docker-compose.yml` | `celery -A src.api.tasks` | worker removed until tasks exist |
+| `Dockerfile` | `src.api.app:create_app` | same, plus `[api,db,workers]` and `PYTHONPATH` |
+| `docker-compose.yml` | `celery -A src.api.tasks` | `celery -A sibyl.tasks.celery_app worker` |
 
-The compose `worker` ran a module that never existed and could only crash-loop; it is
-commented out with a note to restore it pointing at `sibyl.tasks`. `env_file` is now
-optional, since `.env` is gitignored and `docker compose up` previously failed
-outright on a fresh clone.
+The compose `worker` ran a module that never existed and could only crash-loop, so it
+was removed rather than left to fail. "Tasks and persistence" below gave it something
+real to run, and it is back — on the same image as the API, because a separate image
+would let the two drift, and a version skew between them shows up only as jobs that
+fail once they reach the queue.
+
+`env_file` is optional, since `.env` is gitignored and `docker compose up` previously
+failed outright on a fresh clone. Postgres also gained a `pg_isready` healthcheck and
+the API and worker now wait on it: Postgres accepts TCP connections a moment before it
+will accept queries, and without the gate both raced it and crash-looped on first start.
+
+### 10. `forecasting` was never actually packaged
+
+Building and running the image — rather than trusting a green test suite — turned
+up a packaging bug that had been latent since the layer was written.
+
+`src/forecasting/` had no `__init__.py`. Its siblings `src/diagnosis/` and
+`src/sibyl/` both do, so this was an inconsistency rather than a decision, and it
+had two consequences:
+
+- **`find_packages(where="src")` skipped it.** setuptools' `find_packages`
+  requires `__init__.py`, so a non-editable `pip install sibyl` produced a
+  distribution containing `diagnosis` and `sibyl` and **no `forecasting` at all**.
+  Every install to date has been editable, which puts `src/` on the path directly
+  and hides this completely.
+- **The Docker image imported an empty stub instead of the real code.** The
+  builder stage creates stub packages so dependencies can resolve without the
+  source tree, and pip installed those stubs into site-packages. `/app/src` comes
+  first on `sys.path`, but that does not help here: Python prefers a *regular*
+  package found anywhere over a *namespace* package found earlier, so the empty
+  `site-packages/forecasting/__init__.py` shadowed `/app/src/forecasting`.
+
+It had never fired because nothing in the container imported `forecasting.*` —
+`diagnosis` and `sibyl` are regular packages and resolved correctly. Importing
+`forecasting.registry` from `api/app.py` was the first time anything asked.
+
+Fixed by adding the missing `__init__.py`, which addresses both symptoms, and by
+deleting the stub packages in the runtime stage so the shadowing cannot recur.
+`src/sibyl/forecasting/` — an empty, git-tracked package left over from an earlier
+layout — was removed at the same time.
+
+The general lesson is the one this repository keeps relearning: a green suite says
+the code works the way the tests import it. It said nothing about how the code
+gets installed, and only `docker compose up` did.
 
 ---
 
@@ -285,7 +327,9 @@ only because `langchain_ollama` happened to be absent. Installing the package br
 It now stubs the import and asserts the thing actually under test — that a self-hosted
 provider clears the credential gate with no key set.
 
-### 10. The agent has now run for real
+---
+
+## What the first live runs found
 
 Eight runs against `qwen2.5:7b` on a local Ollama daemon — free, no account, and the
 first time any of this executed outside a stub. Two fixtures: **A**, 500 daily points
@@ -329,7 +373,7 @@ usefully have it — it emits `{"name": ..., "arguments": ...}` as message text 
 `tool_calls=[]`, on a one-tool prompt with no other context. Declared capability is
 not evidence; a two-line probe is.
 
-### 11. Tasks and persistence
+### Tasks and persistence — `src/sibyl/{services,tasks,db,models}/`
 
 `/diagnose` runs inline because a diagnosis is milliseconds. A Prophet fit is
 seconds, so `/forecast` writes a `jobs` row, returns `202` with an id, and hands
@@ -384,40 +428,6 @@ test was named `test_empty_data_is_rejected`, which already existed for
 duplicate `test_series_with_nans_handled` in §5, found this time by the linter
 rather than by a full read-through.
 
-### 12. `forecasting` was never actually packaged
-
-Building and running the image — rather than trusting a green test suite — turned
-up a packaging bug that had been latent since the layer was written.
-
-`src/forecasting/` had no `__init__.py`. Its siblings `src/diagnosis/` and
-`src/sibyl/` both do, so this was an inconsistency rather than a decision, and it
-had two consequences:
-
-- **`find_packages(where="src")` skipped it.** setuptools' `find_packages`
-  requires `__init__.py`, so a non-editable `pip install sibyl` produced a
-  distribution containing `diagnosis` and `sibyl` and **no `forecasting` at all**.
-  Every install to date has been editable, which puts `src/` on the path directly
-  and hides this completely.
-- **The Docker image imported an empty stub instead of the real code.** The
-  builder stage creates stub packages so dependencies can resolve without the
-  source tree, and pip installed those stubs into site-packages. `/app/src` comes
-  first on `sys.path`, but that does not help here: Python prefers a *regular*
-  package found anywhere over a *namespace* package found earlier, so the empty
-  `site-packages/forecasting/__init__.py` shadowed `/app/src/forecasting`.
-
-It had never fired because nothing in the container imported `forecasting.*` —
-`diagnosis` and `sibyl` are regular packages and resolved correctly. Importing
-`forecasting.registry` from `api/app.py` was the first time anything asked.
-
-Fixed by adding the missing `__init__.py`, which addresses both symptoms, and by
-deleting the stub packages in the runtime stage so the shadowing cannot recur.
-`src/sibyl/forecasting/` — an empty, git-tracked package left over from an earlier
-layout — was removed at the same time.
-
-The general lesson is the one this repository keeps relearning: a green suite says
-the code works the way the tests import it. It said nothing about how the code
-gets installed, and only `docker compose up` did.
-
 ---
 
 ## What remains
@@ -460,13 +470,13 @@ gets installed, and only `docker compose up` did.
 
 **Next up, in order:**
 
-1. Run the agent against a hosted provider and compare with the local baseline in
-   §10 — in particular whether the 4-call recovery path works at all on a
+1. Run the agent against a hosted provider and compare with the local baseline
+   above — in particular whether the 4-call recovery path works at all on a
    frontier model, which would confirm the ceiling is the model and not the design.
 2. Decide whether the agent gets an endpoint. It is the one layer with no HTTP
    surface, deliberately: minutes per run, provider credentials in the worker, and
-   the reliability profile in §10.
-3. Fix the noiseless-linear-series crash below, or decide it is not worth it.
+   the reliability profile measured above.
+3. Fix the noiseless-linear-series crash listed above, or decide it is not worth it.
 4. Then vector search, with `[vectorsearch]` promoted as it lands.
 
 ---
