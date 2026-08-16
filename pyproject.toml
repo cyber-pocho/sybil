@@ -74,16 +74,21 @@ vectorsearch = [
     "torch>=2.2,<3",
 ]
 
-# Celery workers — not yet implemented (src/sibyl/tasks/ is empty).
+# The Celery worker that runs forecast jobs.
 workers = [
     "celery[redis]>=5.3,<6",
     "redis>=5.0,<7",
 ]
 
-# Persistence — not yet implemented (src/sibyl/db/ is empty).
+# Persistence: the jobs table behind /forecast.
+#
+# psycopg rather than asyncpg, which is what this extra used to carry. asyncpg
+# has no sync interface at all, so it could never have backed the sync engine the
+# Celery worker needs — it was a driver chosen for an async design that was never
+# built. psycopg 3 does both, so an async read path later needs no swap.
 db = [
     "sqlalchemy>=2.0,<3",
-    "asyncpg>=0.29,<1",
+    "psycopg[binary]>=3.1,<4",
     "alembic>=1.13,<2",
 ]
 

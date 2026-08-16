@@ -4,18 +4,38 @@ services:
     # Entry point comes from the image CMD: sibyl.api.app:create_app
     ports:
       - "8000:8000"
-    # Optional: .env is gitignored, and nothing in the app reads it yet, so a
-    # fresh clone should still come up rather than failing on a missing file.
+    environment:
+      DATABASE_URL: postgresql+psycopg://sibyl:sibyl@postgres:5432/sibyl
+      REDIS_URL: redis://redis:6379/0
+    # Optional: .env is gitignored, so a fresh clone should still come up rather
+    # than failing on a missing file.
     env_file:
       - path: .env
         required: false
     depends_on:
-      - redis
-      - postgres
+      redis:
+        condition: service_started
+      postgres:
+        condition: service_healthy
 
-  # A `worker` service ran `celery -A src.api.tasks`, a module that has never
-  # existed — it could only ever crash-loop. It comes back when src/sibyl/tasks/
-  # has real tasks in it, pointing at sibyl.tasks.
+  # Runs the same image as the API with a different command. That is deliberate:
+  # the worker imports the same service code, so a version skew between the two
+  # would show up as jobs that fail only once they reach the queue.
+  worker:
+    build: .
+    command: celery -A sibyl.tasks.celery_app worker --loglevel=info
+    environment:
+      DATABASE_URL: postgresql+psycopg://sibyl:sibyl@postgres:5432/sibyl
+      REDIS_URL: redis://redis:6379/0
+    env_file:
+      - path: .env
+        required: false
+    depends_on:
+      redis:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+
   redis:
     image: redis:7-alpine
     ports:
@@ -29,6 +49,14 @@ services:
       POSTGRES_USER: sibyl
       POSTGRES_PASSWORD: sibyl
       POSTGRES_DB: sibyl
+    # The API and worker both run migrations-dependent code on boot, and Postgres
+    # accepts TCP connections a moment before it will accept queries — without
+    # this they race it and crash-loop on first start.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sibyl -d sibyl"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
     volumes:
       - postgres_data:/var/lib/postgresql/data
 

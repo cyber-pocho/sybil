@@ -1,7 +1,7 @@
 # Sibyl — Project Status Report
 
 **Date:** 2026-08-16
-**Branch:** `main` @ `d9f8f5c` + uncommitted provider-agnostic agent layer
+**Branch:** `agent/provider-agnostic` @ `ff33629` + uncommitted tasks/persistence layer
 **Basis:** full read-through, plus clean-room install / lint / test, a Docker build and
 container probe, and the GitHub Actions history
 
@@ -9,17 +9,18 @@ container probe, and the GitHub Actions history
 
 ## Verdict in one paragraph
 
-**Diagnosis, forecasting, the HTTP API and the agent layer all work.** Tasks,
-persistence and vector search remain unstarted. The repository's defining problem —
+**Diagnosis, forecasting, the HTTP API, the agent, the task queue and persistence
+all work.** Vector search remains unstarted. The repository's defining problem —
 a broken build backend that made `pip install -e .` fail, so **CI failed on all 10
 commits and never executed a single test** — is fixed, and CI has since gone green
 twice on Python 3.11. The suite went from *119 passed / 8 failed / 20 errors / 2
-skipped* to **207 passed, 0 failed, 0 skipped**; `ruff check` from 30 errors to
-clean. The Docker image builds, runs, and serves both endpoints. The agent is now
-provider-agnostic — it runs on any tool-calling chat model, closed or open weights —
-and that change surfaced a second dependency-ceiling bug of the same family as the
-original MAPIE one. The one thing built but not yet exercised against reality is a
-live round-trip against any real provider.
+skipped* to **244 passed, 0 failed, 0 skipped**; `ruff check` from 30 errors to
+clean. The agent is now provider-agnostic — it runs on any tool-calling chat model,
+closed or open weights — and that change surfaced a second dependency-ceiling bug of
+the same family as the original MAPIE one. The agent has now been run for real
+against a local model, and the forecast job path against a real Redis, Celery worker
+and Postgres. What remains unexercised is a live agent round-trip against any
+*hosted* provider.
 
 ---
 
@@ -29,23 +30,28 @@ Everything below was executed, not inferred.
 
 | Check | Result |
 |---|---|
-| `pip install -e ".[dev,api,agents]"` (fresh venv) | ✅ exit 0 |
-| `ruff check src/ tests/` | ✅ All checks passed |
-| `pytest tests/` | ✅ **172 passed**, 0 failed, 0 skipped |
+| `pip install -e ".[dev,api,agents,db,workers]"` (fresh venv) | ✅ exit 0 |
+| `ruff check src/ tests/ scripts/ alembic/` | ✅ All checks passed |
+| `pytest tests/` | ✅ **244 passed**, 0 failed, 0 skipped |
+| Same suite with no provider package installed | ✅ 244 passed — the agent core carries no vendor dep |
 | GitHub Actions on Python 3.11 | ✅ green — Install, Lint, Test all `success` |
-| `docker build` → run → probe | ✅ 982 MB image; `/health` and `/diagnose` both 200 |
-| `docker compose config` (no `.env` present) | ✅ valid |
-| `uvicorn sibyl.api.app:create_app --factory` | ✅ boots, both endpoints 200 |
+| `docker compose config` | ✅ valid |
+| `alembic upgrade head` → SQLite, then downgrade → upgrade | ✅ round-trips |
+| `alembic upgrade head` → **real Postgres 16** | ✅ table + index as designed |
+| Real Redis + real Celery worker + real Postgres round trip | ✅ 202 → queued → `done` with a forecast |
+| Same, for a job that fails | ✅ recorded as `failed` with the reason; worker survived |
+| Agent live against local `qwen2.5:7b` | ✅ ran; see §10 for what it found |
+| `docker build` → `docker compose up` → full job round trip | ✅ 1.08 GB image; migrate, POST, worker, poll, `done` |
 
 | Metric | Before (`0fb8648`) | Now |
 |---|---|---|
 | `pip install -e .` | ❌ `BackendUnavailable` | ✅ exit 0 |
 | CI outcome | ❌ 10/10 runs failed at install | ✅ green |
-| Tests executed in CI | **0, ever** | 207 |
-| Test results | 119 pass / 8 fail / 20 error / 2 skip | **207 pass / 0 fail / 0 skip** |
+| Tests executed in CI | **0, ever** | 244 |
+| Test results | 119 pass / 8 fail / 20 error / 2 skip | **244 pass / 0 fail / 0 skip** |
 | `ruff check` | 30 errors | **0** |
-| Source LOC | 1,383 | 1,836 |
-| Test LOC | 1,226 | 1,714 |
+| Source LOC | 1,383 | 2,349 |
+| Test LOC | 1,226 | 2,192 |
 | LLM providers supported | 1 (hardcoded) | **7, none privileged** |
 
 ---
@@ -64,10 +70,15 @@ Everything below was executed, not inferred.
 | `forecasting/prophet_model.py` | 143 | 22 | ✅ unchanged behaviour |
 | `forecasting/ets_model.py` | 206 | 28 | ✅ **fixed** — was completely broken |
 | `forecasting/conformal.py` | 133 | 22 | ✅ `ConformalWrapper` only; MAPIE removed |
-| `sibyl/api/app.py` | 60 | 10 | 🟡 `/health` + `/diagnose`; verified under uvicorn and in Docker |
-| `sibyl/agents/forecaster_agent.py` | 250 | 18 | 🟡 graph tested against a stub; **no live call to any provider yet** |
+| `sibyl/api/app.py` | 143 | 20 | ✅ `/health`, `/diagnose`, `/forecast` + polling |
+| `sibyl/agents/forecaster_agent.py` | 252 | 21 | ✅ run live 8× against a local model |
 | `sibyl/agents/llm.py` | 218 | 32 | ✅ provider registry; 7 providers, 3 constructed for real |
-| `sibyl/{services,tasks,db,models}` | 0 | — | ⛔ not started |
+| `forecasting/registry.py` | 46 | — | ✅ shared by the agent and the worker |
+| `sibyl/services/forecasting.py` | 93 | 12 | ✅ pure: no db, no queue, no HTTP |
+| `sibyl/models/job.py` | 62 | — | ✅ one table, JSON params and result |
+| `sibyl/db/{engine,base}.py` | 88 | — | ✅ sync engine, lazily built |
+| `sibyl/tasks/{celery_app,forecast}.py` | 105 | 11 | ✅ verified against a real broker |
+| `sibyl/vectorsearch` | 0 | — | ⛔ not started |
 
 ---
 
@@ -318,6 +329,95 @@ usefully have it — it emits `{"name": ..., "arguments": ...}` as message text 
 `tool_calls=[]`, on a one-tool prompt with no other context. Declared capability is
 not evidence; a two-line probe is.
 
+### 11. Tasks and persistence
+
+`/diagnose` runs inline because a diagnosis is milliseconds. A Prophet fit is
+seconds, so `/forecast` writes a `jobs` row, returns `202` with an id, and hands
+the id to Celery. The worker runs it and writes the result back; the client polls
+`GET /forecast/{id}`.
+
+The layering is the point, and it is what makes this testable without infrastructure:
+
+| Layer | Knows about |
+|---|---|
+| `services/forecasting.py` | records in, dict out. No database, no queue, no HTTP. |
+| `tasks/forecast.py` | job rows and the service. Not HTTP. |
+| `api/app.py` | HTTP and job rows. Never runs a forecast itself. |
+
+`run_forecast_job` is a plain function; the Celery task is a three-line wrapper.
+That is what lets the whole worker path be covered by tests that need no broker —
+the only thing left untested is Celery's own delivery, which is not ours to test.
+It was then verified separately against a real Redis, a real worker and a real
+Postgres, in both the success and failure directions.
+
+Decisions worth recording:
+
+- **A failed forecast is a recorded outcome, not a crash.** The worker catches
+  broadly and writes the message to the row. Letting an exception escape would
+  leave the job stuck in `running` and a polling client waiting forever.
+- **The forecast runs outside the database transaction.** Holding a connection
+  open across a multi-second Stan fit buys nothing and costs a connection.
+- **The task is dispatched after the transaction commits.** A worker can pick a
+  message up before a slow commit lands, and would then look up a job that does
+  not exist yet.
+- **The queue carries only an id.** Everything else is in the row, so a retry
+  reads current state rather than a snapshot from when the message was written.
+- **`asyncpg` was replaced with `psycopg`.** The [db] extra shipped an async-only
+  driver, which has no sync interface at all and so could never have backed the
+  sync engine a Celery worker needs — a driver chosen for a design that was never
+  built. It would have failed at the first real connection.
+- **One migration, and a test that it stays honest.** Every other test creates
+  tables with `create_all`, which would pass happily against a stale
+  `alembic/versions`. `test_migration_matches_the_models` runs the real migration
+  and diffs the result against `Base.metadata`, so a column added without a
+  migration fails the suite rather than production.
+
+The forecaster registry also moved out of the agent into
+`forecasting/registry.py`. It was private to the agent, and the worker is a second
+caller that must not import `sibyl.agents` to reach it — that module pulls in
+LangGraph, and a worker fitting a Prophet model has no business requiring an LLM
+stack.
+
+`ruff` caught one real defect during this work: the new `/forecast` empty-body
+test was named `test_empty_data_is_rejected`, which already existed for
+`/diagnose`. It would have silently shadowed it — the same failure mode as the
+duplicate `test_series_with_nans_handled` in §5, found this time by the linter
+rather than by a full read-through.
+
+### 12. `forecasting` was never actually packaged
+
+Building and running the image — rather than trusting a green test suite — turned
+up a packaging bug that had been latent since the layer was written.
+
+`src/forecasting/` had no `__init__.py`. Its siblings `src/diagnosis/` and
+`src/sibyl/` both do, so this was an inconsistency rather than a decision, and it
+had two consequences:
+
+- **`find_packages(where="src")` skipped it.** setuptools' `find_packages`
+  requires `__init__.py`, so a non-editable `pip install sibyl` produced a
+  distribution containing `diagnosis` and `sibyl` and **no `forecasting` at all**.
+  Every install to date has been editable, which puts `src/` on the path directly
+  and hides this completely.
+- **The Docker image imported an empty stub instead of the real code.** The
+  builder stage creates stub packages so dependencies can resolve without the
+  source tree, and pip installed those stubs into site-packages. `/app/src` comes
+  first on `sys.path`, but that does not help here: Python prefers a *regular*
+  package found anywhere over a *namespace* package found earlier, so the empty
+  `site-packages/forecasting/__init__.py` shadowed `/app/src/forecasting`.
+
+It had never fired because nothing in the container imported `forecasting.*` —
+`diagnosis` and `sibyl` are regular packages and resolved correctly. Importing
+`forecasting.registry` from `api/app.py` was the first time anything asked.
+
+Fixed by adding the missing `__init__.py`, which addresses both symptoms, and by
+deleting the stub packages in the runtime stage so the shadowing cannot recur.
+`src/sibyl/forecasting/` — an empty, git-tracked package left over from an earlier
+layout — was removed at the same time.
+
+The general lesson is the one this repository keeps relearning: a green suite says
+the code works the way the tests import it. It said nothing about how the code
+gets installed, and only `docker compose up` did.
+
 ---
 
 ## What remains
@@ -344,18 +444,30 @@ not evidence; a two-line probe is.
   regardless of how many anomalies exist — 37 where 3 were injected, in the 730-point
   fixture. The de-spiking step tolerates this, but the reported `anomaly_count` is
   closer to a fixed quota than a finding.
-- The agent exposes only Prophet and ETS. Adding a forecaster to `_MODELS` is all it
-  takes for the agent to consider it, since the card supplies the description.
+- The agent exposes only Prophet and ETS. Adding a forecaster to
+  `forecasting/registry.py` is all it takes for both the agent and the worker to
+  consider it, since the card supplies the description.
+- **`run_full_diagnosis` raises on a perfectly noiseless linear series** —
+  `ValueError: Invalid input, x is constant`, from a normality test handed
+  zero-variance residuals after detrending. Found by accident while verifying the
+  job failure path with a synthetic fixture that had no noise. Pre-existing and
+  unrelated to persistence; confirmed by calling the pipeline directly. Real data
+  always has noise, so this is a synthetic-input edge case rather than a live
+  hazard — but the error names nothing a caller could act on.
+- A job row stores the caller's full input in `params`, so a row is roughly as
+  large as the series posted. Fine at this scale; the fix at a larger one is
+  object storage plus a key, not a bigger column.
 
 **Next up, in order:**
 
-1. Run the agent against a local `ollama` model first — free, no account, and it
-   shakes out prompt and tool-calling problems before any paid call. Then run a hosted
-   provider and compare.
-2. Tune the system prompt on what comes back, and decide whether one prompt serves
-   every provider or whether the weaker ones need their own.
-3. Commit and push; confirm CI stays green with `[agents]` and no provider installed.
-4. Then tasks / persistence, each with its extra promoted as it lands.
+1. Run the agent against a hosted provider and compare with the local baseline in
+   §10 — in particular whether the 4-call recovery path works at all on a
+   frontier model, which would confirm the ceiling is the model and not the design.
+2. Decide whether the agent gets an endpoint. It is the one layer with no HTTP
+   surface, deliberately: minutes per run, provider credentials in the worker, and
+   the reliability profile in §10.
+3. Fix the noiseless-linear-series crash below, or decide it is not worth it.
+4. Then vector search, with `[vectorsearch]` promoted as it lands.
 
 ---
 

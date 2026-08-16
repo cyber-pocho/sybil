@@ -12,9 +12,11 @@ Sibyl ingests raw time-series DataFrames and runs a layered diagnostic suite: pr
 |---|---|
 | Diagnosis (`src/diagnosis/`) | ✅ Implemented, fully covered |
 | Forecasting (`src/forecasting/`) | ✅ Prophet, ETS, split-conformal intervals |
-| HTTP API (`src/sibyl/api/`) | 🟡 `/health` and `/diagnose` only |
+| HTTP API (`src/sibyl/api/`) | ✅ `/health`, `/diagnose`, `/forecast` (async jobs) |
 | Agent (`src/sibyl/agents/`) | ✅ LangGraph model-selection agent, any LLM provider |
-| Tasks, persistence, vector search | ⛔ Not started — empty packages |
+| Tasks (`src/sibyl/tasks/`) | ✅ Celery worker running forecast jobs |
+| Persistence (`src/sibyl/db/`, `models/`) | ✅ SQLAlchemy + Alembic, one `jobs` table |
+| Vector search | ⛔ Not started — empty package |
 
 ## Project layout
 
@@ -32,16 +34,22 @@ src/
 │   ├── prophet_model.py# Meta's additive decomposition model
 │   ├── ets_model.py    # State-space Error-Trend-Seasonal (statsmodels)
 │   ├── conformal.py    # Split-conformal prediction intervals for any forecaster
-│   └── schemas.py      # ForecastResult, ModelCard
+│   ├── schemas.py      # ForecastResult, ModelCard
+│   └── registry.py     # MODELS by name — shared by the agent and the worker
 └── sibyl/              # Application layer
     ├── api/app.py      # FastAPI factory — the service entry point
     ├── agents/
     │   ├── forecaster_agent.py  # LangGraph agent: diagnose → pick a model → explain
     │   └── llm.py               # Provider registry — the only file naming a vendor
-    ├── services/       # Business logic        (empty)
-    ├── tasks/          # Celery workers        (empty)
-    ├── models/         #                       (empty)
-    └── db/             # SQLAlchemy, Alembic   (empty)
+    ├── services/
+    │   └── forecasting.py       # diagnose + fit + predict; no db, no queue
+    ├── tasks/
+    │   ├── celery_app.py        # the Celery app
+    │   └── forecast.py          # the worker: run a job, record what happened
+    ├── models/job.py   # the Job ORM model
+    └── db/             # engine, session scope, declarative base
+
+alembic/                # Migrations; 0001 creates the jobs table
 
 tests/
 ├── unit/               # Per-module tests; the agent runs against a stub LLM
@@ -51,7 +59,7 @@ scripts/
 └── run_agent_live.py   # Run the agent against a real model, any provider
 ```
 
-211 tests, no skips. `ruff check` clean.
+244 tests, no skips. `ruff check` clean.
 
 ## Diagnostic pipeline
 
@@ -291,6 +299,8 @@ make run-api        # uvicorn sibyl.api.app:create_app --factory, on :8000
 |---|---|
 | `GET /health` | Liveness probe |
 | `POST /diagnose` | Run the full diagnosis over row-oriented JSON records |
+| `POST /forecast` | Queue a forecast job — returns `202` and a job id |
+| `GET /forecast/{id}` | Poll that job for status, result, or error |
 
 ```bash
 curl -X POST localhost:8000/diagnose \
@@ -299,6 +309,44 @@ curl -X POST localhost:8000/diagnose \
 ```
 
 Returns `{"report": <FullDiagnosisReport>, "summary": "<6-line digest>"}`. Input the pipeline cannot diagnose — no numeric columns, or an unknown `target_column` — comes back as 422. Interactive docs at `/docs`.
+
+### Forecast jobs
+
+`/diagnose` runs inline because a diagnosis is milliseconds. Fitting Prophet is
+seconds, so `/forecast` does not: it writes a job, hands back an id, and returns
+`202`. The work happens in a Celery worker, and the result lands in Postgres where
+a client can collect it whenever it likes.
+
+```bash
+make migrate        # alembic upgrade head — run before either process starts
+make run-api        # the API
+make run-worker     # celery -A sibyl.tasks.celery_app worker
+```
+
+```bash
+curl -X POST localhost:8000/forecast \
+  -H 'Content-Type: application/json' \
+  -d '{"data": [...], "target_column": "sales", "model_name": "ets", "horizon": 14}'
+# 202  {"id": "9f1c...", "status": "pending", "result": null, "error": null}
+
+curl localhost:8000/forecast/9f1c...
+# 200  {"id": "9f1c...", "status": "done", "result": {"diagnosis": ..., "summary": ..., "forecast": ...}}
+```
+
+A job is `pending` → `running` → `done` or `failed`. **A failed forecast is a
+recorded outcome, not a lost job**: the worker catches whatever the forecaster
+raised, writes it to `error`, and the row still reaches a terminal state — a
+client polling it never hangs. An unknown `model_name` is the one thing rejected
+inline with a `422`, because the caller is still on the phone and can fix it.
+
+```json
+{"id": "...", "status": "failed",
+ "error": "ValueError: prophet needs at least 100 usable observations and this series has 60. Models that fit: ets."}
+```
+
+The queue carries only the job id. Everything the work needs is already in the
+row, which keeps messages small and means a retry reads current state rather than
+a snapshot from when the message was written.
 
 ## Stack
 
@@ -313,8 +361,8 @@ Core install is the numeric stack only. Everything else is an extra, so profilin
 | Agent | LangGraph, langchain-core | `[agents]` | in use |
 | LLM provider | one of langchain-{anthropic,openai,google-genai,mistralai,groq,ollama} | `[anthropic]` … `[ollama]` | in use, pick one |
 | Vector search | FAISS, sentence-transformers, PyTorch | `[vectorsearch]` | planned |
-| Task queue | Celery + Redis | `[workers]` | planned |
-| Database | SQLAlchemy, asyncpg, Alembic | `[db]` | planned |
+| Task queue | Celery + Redis | `[workers]` | in use |
+| Database | SQLAlchemy, psycopg, Alembic | `[db]` | in use |
 | Visualisation | Plotly, matplotlib | `[viz]` | planned |
 | Observability / payments | Weights & Biases, Stripe | `[ops]` | planned |
 
@@ -323,8 +371,8 @@ Dependencies carry upper version bounds. This is deliberate: an unpinned `mapie`
 ## Getting started
 
 ```bash
-# Install (core + dev tools + API + agent, no model provider)
-make install          # pip install -e ".[dev,api,agents]"
+# Install (core + dev tools + API + agent + persistence + worker, no model provider)
+make install          # pip install -e ".[dev,api,agents,db,workers]"
 
 # Add whichever provider you intend to use
 pip install -e ".[anthropic]"   # or openai / google / mistral / groq / ollama
@@ -338,8 +386,14 @@ make lint             # ruff check src tests
 # Start API (dev)
 make run-api          # uvicorn with --reload on :8000
 
+# Create the schema (SQLite by default; set DATABASE_URL for Postgres)
+make migrate          # alembic upgrade head
+
+# Start the worker that runs forecast jobs
+make run-worker       # celery -A sibyl.tasks.celery_app worker
+
 # Start the stack
-make docker-up        # api + redis + postgres
+make docker-up        # api + worker + redis + postgres
 ```
 
 ## Environment variables
@@ -356,9 +410,16 @@ Read by the agent today:
 | `SIBYL_LLM_BASE_URL` | endpoint for `openai_compatible`; optional for `ollama` |
 | `<PROVIDER>_API_KEY` | the credential for the provider you chose, if it needs one |
 
-Not read by any code yet: `DATABASE_URL`, `REDIS_URL`, `WANDB_API_KEY`,
-`STRIPE_SECRET_KEY`, `FAISS_INDEX_PATH`. `.env` stays optional — the API and
-`docker compose up` both start without one.
+Read by the persistence and task layers:
+
+| Variable | Purpose |
+|---|---|
+| `DATABASE_URL` | SQLAlchemy URL; defaults to `sqlite:///./sibyl.db` so a fresh clone runs with no infrastructure |
+| `REDIS_URL` | Celery broker and result backend; defaults to `redis://localhost:6379/0` |
+
+Not read by any code yet: `WANDB_API_KEY`, `STRIPE_SECRET_KEY`,
+`FAISS_INDEX_PATH`. `.env` stays optional — the API and `docker compose up` both
+start without one.
 
 ## CI
 

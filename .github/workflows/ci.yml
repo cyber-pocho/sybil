@@ -16,12 +16,14 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install -e ".[dev,api,agents]"
+        run: pip install -e ".[dev,api,agents,db,workers]"
 
       - name: Lint
-        run: ruff check src/ tests/
+        run: ruff check src/ tests/ scripts/ alembic/
 
       # tests/ rather than tests/unit/ — the integration suite is the only
       # end-to-end cover of run_full_diagnosis and was never being run.
+      # The suite covers the worker by calling its function directly, so no
+      # broker or database is needed — SQLite in a tmp dir stands in for Postgres.
       - name: Test
         run: pytest tests/ -v

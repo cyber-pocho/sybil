@@ -36,19 +36,9 @@ from langgraph.prebuilt import ToolNode, tools_condition
 
 from diagnosis.pipeline import run_full_diagnosis
 from diagnosis.schemas import FullDiagnosisReport
-from forecasting.base import BaseForecaster
-from forecasting.conformal import ConformalWrapper
-from forecasting.ets_model import ETSForecaster
-from forecasting.prophet_model import ProphetForecaster
+from forecasting.registry import MODELS, build, models_that_fit
 from forecasting.schemas import ForecastResult
 from sibyl.agents.llm import bind_tools, build_llm  # noqa: F401  (build_llm re-exported)
-
-# Model registry. Adding a forecaster here is all it takes for the agent to
-# consider it — the card supplies the description the LLM reasons over.
-_MODELS: dict[str, type[BaseForecaster]] = {
-    "prophet": ProphetForecaster,
-    "ets":     ETSForecaster,
-}
 
 # Tuned against the weakest model the agent supports — a 7B local one — because a
 # prompt that holds there holds everywhere. Each rule below exists because the
@@ -115,7 +105,7 @@ def _build_tools(series: pd.Series, run: AgentRun) -> list[StructuredTool]:
     def list_models() -> str:
         """List the available forecasting models and what each one is suited to."""
         lines = []
-        for name, cls in _MODELS.items():
+        for name, cls in MODELS.items():
             card = cls().card
             lines.append(
                 f"{name}: {card.description}\n"
@@ -139,14 +129,12 @@ def _build_tools(series: pd.Series, run: AgentRun) -> list[StructuredTool]:
             horizon:    number of steps to forecast.
             conformal:  replace the model's native intervals with conformal ones.
         """
-        if model_name not in _MODELS:
+        try:
+            model = build(model_name, conformal=conformal)
+        except KeyError:
             # Returned rather than raised: the LLM can correct itself from this,
             # whereas an exception would abort the whole graph.
-            return f"Unknown model '{model_name}'. Available: {', '.join(_MODELS)}."
-
-        model: BaseForecaster = _MODELS[model_name]()
-        if conformal:
-            model = ConformalWrapper(model)
+            return f"Unknown model '{model_name}'. Available: {', '.join(MODELS)}."
 
         # The cards advertise a sample floor that no forecaster actually enforces:
         # ProphetForecaster.fit() will fit 60 points against its own stated minimum
@@ -162,10 +150,7 @@ def _build_tools(series: pd.Series, run: AgentRun) -> list[StructuredTool]:
             # reasoning its way to the right alternative and then describing the
             # call instead of making it — every step removed is a step it cannot
             # fumble. The closing imperative is aimed at the same weakness.
-            fits = sorted(
-                name for name, cls in _MODELS.items()
-                if cls().card.min_samples_required <= usable
-            )
+            fits = models_that_fit(usable)
             return (
                 f"Refused: {model.card.name} needs at least {floor} usable observations "
                 f"and this series has {usable}. "

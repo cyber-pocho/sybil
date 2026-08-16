@@ -3,6 +3,11 @@ import pandas as pd
 import pytest
 
 pytest.importorskip("fastapi", reason="API layer requires the [api] extra")
+# app.py imports the persistence and queue layers for /forecast, so importing it
+# needs those extras too — without these the module fails to import and the whole
+# file errors out at collection instead of skipping.
+pytest.importorskip("sqlalchemy", reason="API layer requires the [db] extra")
+pytest.importorskip("celery", reason="API layer requires the [workers] extra")
 
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -84,3 +89,108 @@ def test_no_numeric_columns_is_422(client):
 def test_empty_data_is_rejected(client):
     # min_length=1 on the field — pydantic rejects this before the pipeline runs
     assert client.post("/diagnose", json={"data": []}).status_code == 422
+
+
+# ── forecast: accepted as a job, not run inline ───────────────────────────────
+
+def _post_forecast(client, payload, **over):
+    body = {"data": payload, "target_column": "sales", "model_name": "ets", "horizon": 7} | over
+    return client.post("/forecast", json=body)
+
+
+def test_forecast_is_accepted_with_202(db, no_broker, payload):
+    # A fresh client per test: the module-scoped one would outlive the db fixture.
+    client = TestClient(create_app())
+    r = _post_forecast(client, payload)
+    assert r.status_code == 202
+    assert r.json()["status"] == "pending"
+
+
+def test_forecast_returns_a_job_id(db, no_broker, payload):
+    client = TestClient(create_app())
+    job_id = _post_forecast(client, payload).json()["id"]
+    assert job_id
+
+
+def test_forecast_dispatches_the_job_it_wrote(db, no_broker, payload):
+    # The id handed to the caller and the id put on the queue must be the same,
+    # or the worker runs one job while the client polls another.
+    client = TestClient(create_app())
+    job_id = _post_forecast(client, payload).json()["id"]
+    assert no_broker == [job_id]
+
+
+def test_unknown_model_is_422_before_any_job_is_written(db, no_broker, payload):
+    client = TestClient(create_app())
+    r = _post_forecast(client, payload, model_name="arima")
+    assert r.status_code == 422
+    assert "Unknown model" in r.json()["detail"]
+    assert no_broker == []   # nothing queued
+
+
+def test_forecast_empty_data_is_rejected(db, no_broker):
+    # Named for its endpoint: the /diagnose case is already
+    # `test_empty_data_is_rejected`, and reusing the name would shadow it — the
+    # same way a duplicate definition silently disabled a stationarity test here
+    # before anyone was running the suite.
+    client = TestClient(create_app())
+    assert client.post("/forecast", json={"data": []}).status_code == 422
+
+
+def test_non_positive_horizon_is_rejected(db, no_broker, payload):
+    client = TestClient(create_app())
+    assert _post_forecast(client, payload, horizon=0).status_code == 422
+
+
+# ── polling a job ─────────────────────────────────────────────────────────────
+
+def test_pending_job_reports_pending(db, no_broker, payload):
+    client = TestClient(create_app())
+    job_id = _post_forecast(client, payload).json()["id"]
+    r = client.get(f"/forecast/{job_id}")
+    assert r.status_code == 200
+    assert r.json()["status"] == "pending"
+    assert r.json()["result"] is None
+
+
+def test_unknown_job_is_404(db, no_broker):
+    client = TestClient(create_app())
+    assert client.get("/forecast/no-such-job").status_code == 404
+
+
+def test_full_round_trip_post_then_work_then_poll(db, no_broker, payload):
+    """The whole contract: accept, run the worker, read the result back.
+
+    This is the one test that proves the pieces line up — the params the endpoint
+    stored are the params the service accepts, and the result it wrote survives a
+    round trip through the JSON column.
+    """
+    from sibyl.tasks.forecast import run_forecast_job
+
+    client = TestClient(create_app())
+    job_id = _post_forecast(client, payload).json()["id"]
+
+    run_forecast_job(job_id)   # what the Celery worker would do
+
+    body = client.get(f"/forecast/{job_id}").json()
+    assert body["status"] == "done"
+    assert len(body["result"]["forecast"]["point_forecast"]) == 7
+    assert body["result"]["diagnosis"]["target_column"] == "sales"
+    assert body["error"] is None
+
+
+def test_round_trip_records_a_failure(db, no_broker, payload):
+    from sibyl.tasks.forecast import run_forecast_job
+
+    client = TestClient(create_app())
+    # 60 points, against prophet's floor of 100: the service refuses, and the
+    # failure has to reach the caller through the job row rather than a 500.
+    short = payload[:60]
+    job_id = _post_forecast(client, short, model_name="prophet").json()["id"]
+
+    run_forecast_job(job_id)
+
+    body = client.get(f"/forecast/{job_id}").json()
+    assert body["status"] == "failed"
+    assert "needs at least 100" in body["error"]
+    assert body["result"] is None
