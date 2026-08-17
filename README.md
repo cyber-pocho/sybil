@@ -509,6 +509,11 @@ make install          # pip install -e ".[dev,api,agents,db,workers]"
 # Add whichever provider you intend to use
 pip install -e ".[anthropic]"   # or openai / google / mistral / groq / ollama
 
+# Optional: semantic recall over past forecasts. Installing it is the whole
+# switch — the worker starts indexing finished jobs and /search stops
+# answering 503. It pulls torch, so it is not in `make install`.
+pip install -e ".[vectorsearch]"
+
 # Run tests
 make test             # pytest → tests/unit + tests/integration
 
@@ -571,7 +576,10 @@ optional — the API and `docker compose up` both start without one.
 
 GitHub Actions runs on every push to `main` and all PRs: `ruff check src/ tests/ scripts/ alembic/`, then `pytest tests/ -v` across both the unit and integration suites. `make lint` runs the identical lint command, so a green local run means a green CI run.
 
-CI installs `[dev,api,agents,db,workers]` and **no provider package at all**. That is deliberate on both counts:
+CI installs `[dev,api,agents,db,workers]` — **no provider package and no `[vectorsearch]`**. That is deliberate on every count:
 
 - The agent tests run against a stub LLM, so no vendor credential is needed — and a green CI run is itself the evidence that the agent core carries no vendor dependency.
 - The worker tests call `run_forecast_job` directly and SQLite stands in for Postgres, so no broker and no database server are needed either. Celery's own message delivery is the one thing CI does not cover; it is verified by hand against a real Redis and Postgres instead.
+- The vector search tests inject a word-count embedder, so CI never downloads model weights — and a green run proves the layer degrades the way it claims to when the extra is absent. This was checked locally by blocking the `sentence_transformers` and `torch` imports outright and running the whole suite: 279 passed, same as with them installed.
+
+What CI cannot cover is anything that needs a real model or a real broker: a live LLM round trip, Celery's delivery, and the `sentence-transformers` path. Those have their own scripts — `scripts/run_agent_live.py` and `scripts/run_vectorsearch_live.py` — because "not covered by CI" and "never run" are different things and the repository has already paid for confusing them.

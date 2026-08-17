@@ -48,7 +48,7 @@ Everything below was executed, not inferred.
 | `alembic upgrade head` → **real Postgres 16** | ✅ table + index as designed |
 | Real Redis + real Celery worker + real Postgres round trip | ✅ 202 → queued → `done` with a forecast |
 | Same, for a job that fails | ✅ recorded as `failed` with the reason; worker survived |
-| Agent live against local `qwen2.5:7b` | ✅ ran; see "What the first live runs found" |
+| Agent live against local `qwen2.5:7b` | ✅ ran; see "The agent's first live runs" |
 | `docker build` → `docker compose up` → full job round trip | ✅ 1.08 GB image; migrate, POST, worker, poll, `done` |
 
 | Metric | Before (`0fb8648`) | Now |
@@ -79,7 +79,7 @@ Everything below was executed, not inferred.
 | `forecasting/ets_model.py` | 206 | 28 | ✅ **fixed** — was completely broken |
 | `forecasting/conformal.py` | 133 | 22 | ✅ `ConformalWrapper` only; MAPIE removed |
 | `sibyl/api/app.py` | 204 | 27 | ✅ `/health`, `/diagnose`, `/forecast` + polling, `/search` |
-| `sibyl/agents/forecaster_agent.py` | 252 | 21 | ✅ run live 8× against a local model |
+| `sibyl/agents/forecaster_agent.py` | 252 | 22 | ✅ run live 8× against a local model |
 | `sibyl/agents/llm.py` | 218 | 32 | ✅ provider registry; 7 providers, 3 constructed for real |
 | `forecasting/registry.py` | 46 | — | ✅ shared by the agent and the worker |
 | `sibyl/services/forecasting.py` | 93 | 12 | ✅ pure: no db, no queue, no HTTP |
@@ -88,7 +88,7 @@ Everything below was executed, not inferred.
 | `sibyl/db/{engine,base}.py` | 88 | — | ✅ sync engine, lazily built |
 | `sibyl/tasks/{celery_app,forecast}.py` | 131 | 14 | ✅ verified against a real broker; now indexes on success |
 | `sibyl/vectorsearch/search.py` | 60 | 9 | ✅ exact cosine top-k in numpy; no FAISS |
-| `sibyl/vectorsearch/store.py` | 136 | 12 | ✅ remember / recall, one embedding space at a time |
+| `sibyl/vectorsearch/store.py` | 136 | 11 | ✅ remember / recall, one embedding space at a time |
 | `sibyl/vectorsearch/embeddings.py` | 113 | 5 | ✅ run live against `all-MiniLM-L6-v2`; cached after that run showed why |
 
 ---
@@ -270,10 +270,25 @@ gets installed, and only `docker compose up` did.
 
 ### HTTP API — `src/sibyl/api/app.py`
 
-A `create_app()` factory with `/health` and `POST /diagnose`, which runs
-`run_full_diagnosis` over row-oriented JSON records and returns the report plus the
-six-line digest. Input the pipeline cannot diagnose returns 422 rather than 500. Ten
-tests; verified serving under uvicorn and from the Docker container.
+A `create_app()` factory. It started as `/health` and `POST /diagnose` — the latter
+running `run_full_diagnosis` over row-oriented JSON records and returning the report
+plus the six-line digest — and grew an endpoint with each layer that landed behind
+it. Twenty-seven tests; verified serving under uvicorn and from the Docker container.
+
+| Endpoint | Runs | Why there and not elsewhere |
+|---|---|---|
+| `GET /health` | inline | liveness, nothing more |
+| `POST /diagnose` | inline | a diagnosis is milliseconds |
+| `POST /forecast` | queued, `202` + id | a Prophet fit is seconds; see "Tasks and persistence" |
+| `GET /forecast/{id}` | inline | one row lookup |
+| `POST /search` | inline | one embedding plus a matmul; see "Vector search" |
+
+The consistent rule is that anything the caller can fix comes back as a **422 while
+they are still on the phone**, not as a 500 or a job that fails later: input the
+pipeline cannot diagnose, an unknown `model_name`, a `/search` body carrying both
+`query` and `data` or neither. The one exception is 503, which `/search` returns when
+`[vectorsearch]` is not installed — the service is fine and the request was fine, so
+a 500 would point the caller at the wrong thing entirely.
 
 ### Agent — `src/sibyl/agents/forecaster_agent.py`
 
@@ -291,7 +306,7 @@ survive a round trip through a JSON tool call. An unknown model name returns an 
 string rather than raising, so the agent can correct itself instead of aborting the
 graph; a `recursion_limit` bounds runaway loops.
 
-**Eighteen tests, all against an injected stub LLM** — a real call would be
+**Twenty-two tests, all against an injected stub LLM** — a real call would be
 non-deterministic, slow, and would need some vendor's credential in CI, none of which
 tests the graph. One of those tests initially passed for the wrong reason: the stub
 replayed a single `AIMessage` object, and LangGraph's `add_messages` reducer merges by
@@ -336,9 +351,7 @@ only because `langchain_ollama` happened to be absent. Installing the package br
 It now stubs the import and asserts the thing actually under test — that a self-hosted
 provider clears the credential gate with no key set.
 
----
-
-## What the first live runs found
+### The agent's first live runs
 
 Eight runs against `qwen2.5:7b` on a local Ollama daemon — free, no account, and the
 first time any of this executed outside a stub. Two fixtures: **A**, 500 daily points
@@ -394,8 +407,14 @@ The layering is the point, and it is what makes this testable without infrastruc
 | Layer | Knows about |
 |---|---|
 | `services/forecasting.py` | records in, dict out. No database, no queue, no HTTP. |
-| `tasks/forecast.py` | job rows and the service. Not HTTP. |
-| `api/app.py` | HTTP and job rows. Never runs a forecast itself. |
+| `vectorsearch/{search,embeddings}.py` | arrays and strings. No database, no queue, no HTTP. |
+| `vectorsearch/store.py` | memory rows and an injected embedder. Not HTTP, not Celery. |
+| `tasks/forecast.py` | job rows, the service, and the store. Not HTTP. |
+| `api/app.py` | HTTP, job rows, and the store. Never runs a forecast itself. |
+
+Vector search kept the same discipline when it landed, which is why the search
+maths could be tested against exact cosine values and the store against a scratch
+SQLite file, with no model weights involved in either.
 
 `run_forecast_job` is a plain function; the Celery task is a three-line wrapper.
 That is what lets the whole worker path be covered by tests that need no broker —
@@ -500,7 +519,7 @@ Decisions worth recording:
   provider fires a request at somebody's paid endpoint, while a defaulted
   embedding model downloads open weights and runs them on the local CPU.
 
-#### What the first live run found
+#### Vector search's first live run
 
 `scripts/run_vectorsearch_live.py` runs three real forecast jobs end to end —
 diagnose, fit, predict, embed, store — against a scratch SQLite file, then
