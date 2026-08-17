@@ -67,9 +67,20 @@ mistral   = ["langchain-mistralai>=1.0,<2"]
 groq      = ["langchain-groq>=1.0,<2"]
 ollama    = ["langchain-ollama>=1.0,<2"]
 
-# Semantic retrieval over past forecasts — not yet implemented.
+# Semantic retrieval over past forecasts. Installing this is the whole switch:
+# the worker indexes finished jobs when it can import an embedding model, and
+# skips silently when it cannot, so there is no flag to also get right.
+#
+# faiss-cpu used to be listed here and is gone. Nothing imported it, and nothing
+# needs to: a flat index over a few thousand past forecasts is one matmul plus a
+# partial sort, which is exactly what src/sibyl/vectorsearch/search.py does in
+# numpy. FAISS is for trading exactness for speed at a scale this is nowhere
+# near, and a compiled dependency nobody imports is the pattern that already cost
+# this project twice — see mapie and asyncpg.
+#
+# torch stays: sentence-transformers pulls it in regardless, and pinning a
+# transitive dependency that large is worth the line.
 vectorsearch = [
-    "faiss-cpu>=1.8,<2",
     "sentence-transformers>=3.0,<6",
     "torch>=2.2,<3",
 ]

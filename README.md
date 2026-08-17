@@ -12,11 +12,11 @@ Sibyl ingests raw time-series DataFrames and runs a layered diagnostic suite: pr
 |---|---|
 | Diagnosis (`src/diagnosis/`) | ✅ Implemented, fully covered |
 | Forecasting (`src/forecasting/`) | ✅ Prophet, ETS, split-conformal intervals |
-| HTTP API (`src/sibyl/api/`) | ✅ `/health`, `/diagnose`, `/forecast` (async jobs) |
+| HTTP API (`src/sibyl/api/`) | ✅ `/health`, `/diagnose`, `/forecast` (async jobs), `/search` |
 | Agent (`src/sibyl/agents/`) | ✅ LangGraph model-selection agent, any LLM provider |
 | Tasks (`src/sibyl/tasks/`) | ✅ Celery worker running forecast jobs |
-| Persistence (`src/sibyl/db/`, `models/`) | ✅ SQLAlchemy + Alembic, one `jobs` table |
-| Vector search | ⛔ Not started — only the `[vectorsearch]` extra exists |
+| Persistence (`src/sibyl/db/`, `models/`) | ✅ SQLAlchemy + Alembic, `jobs` and `memories` |
+| Vector search (`src/sibyl/vectorsearch/`) | ✅ Semantic recall over past forecasts |
 
 ## Project layout
 
@@ -46,20 +46,25 @@ src/
     ├── tasks/
     │   ├── celery_app.py        # the Celery app
     │   └── forecast.py          # the worker: run a job, record what happened
-    ├── models/job.py   # the Job ORM model
+    ├── vectorsearch/
+    │   ├── embeddings.py        # text → vector; one local model behind a Protocol
+    │   ├── search.py            # exact cosine top-k, in numpy
+    │   └── store.py             # remember a finished job, recall similar ones
+    ├── models/         # the ORM rows: job.py, memory.py
     └── db/             # engine, session scope, declarative base
 
-alembic/                # Migrations; 0001 creates the jobs table
+alembic/                # Migrations; 0001 jobs, 0002 memories
 
 tests/
 ├── unit/               # Per-module tests; the agent runs against a stub LLM
 └── integration/        # End-to-end run_full_diagnosis coverage
 
 scripts/
-└── run_agent_live.py   # Run the agent against a real model, any provider
+├── run_agent_live.py         # Run the agent against a real model, any provider
+└── run_vectorsearch_live.py  # Index three real jobs, then search them
 ```
 
-244 tests, no skips. `ruff check` clean.
+279 tests, no skips. `ruff check` clean.
 
 ## Diagnostic pipeline
 
@@ -301,6 +306,7 @@ make run-api        # uvicorn sibyl.api.app:create_app --factory, on :8000
 | `POST /diagnose` | Run the full diagnosis over row-oriented JSON records |
 | `POST /forecast` | Queue a forecast job — returns `202` and a job id |
 | `GET /forecast/{id}` | Poll that job for status, result, or error |
+| `POST /search` | Find past forecasts over series like this one |
 
 ```bash
 curl -X POST localhost:8000/diagnose \
@@ -352,6 +358,128 @@ The queue carries only the job id. Everything the work needs is already in the
 row, which keeps messages small and means a retry reads current state rather than
 a snapshot from when the message was written.
 
+## Vector search
+
+Every forecast the worker finishes is remembered: its six-line diagnosis digest is
+embedded and stored alongside the model that was run on it. `/search` answers the
+one question the `jobs` table cannot — *have we seen a series like this before, and
+what did we do about it?*
+
+```bash
+pip install -e ".[vectorsearch]"
+```
+
+Installing the extra is the whole switch. The worker indexes a finished job when it
+can import an embedding model and skips silently when it cannot, so a worker without
+the extra runs jobs exactly as before and remembers nothing. There is no flag,
+because a flag would be a second thing to get wrong.
+
+Search by text, or by the data itself:
+
+```bash
+curl -X POST localhost:8000/search \
+  -H 'Content-Type: application/json' \
+  -d '{"query": "daily series with strong weekly seasonality", "k": 5}'
+
+# or post the series and let the same diagnosis that built the memories build the query
+curl -X POST localhost:8000/search \
+  -H 'Content-Type: application/json' \
+  -d '{"data": [{"date": "2024-01-01", "sales": 100}, ...], "target_column": "sales", "k": 5}'
+```
+
+```json
+{"query": "Dataset: 365 rows, daily frequency, Jan 2024 to Dec 2024.\n...",
+ "hits": [{"job_id": "9f1c...", "score": 0.91, "model_name": "prophet",
+           "text": "Dataset: 730 rows, daily frequency...",
+           "meta": {"target_column": "sales", "horizon": 30, "frequency": "daily"}}]}
+```
+
+The `data` form is the one to use, and the section below has the numbers for why.
+Describing a series in words means guessing which words the digest happened to use;
+posting the series runs the same `run_full_diagnosis` the memories were built from,
+so both sides of the comparison are written by the same code. The response echoes
+the text that was actually embedded, which is what makes a surprising ranking
+debuggable rather than mysterious.
+
+### How it works, and what it deliberately is not
+
+| Piece | What it does |
+|---|---|
+| `embeddings.py` | a local sentence-transformers model behind an `Embedder` Protocol |
+| `search.py` | normalise, one matmul, `argpartition` for the top k — exact cosine |
+| `store.py` | write a memory, read them all back, rank them |
+| `models/memory.py` | the `memories` table: text, `float32` embedding, model, metadata |
+
+**No FAISS, and the dependency is gone from `[vectorsearch]`.** A flat index over a
+few thousand past forecasts *is* a matrix multiply plus a partial sort. FAISS is how
+you trade exactness for speed at a scale this is nowhere near, and a compiled
+dependency nobody imports is the pattern that already cost this project twice
+(`mapie`, `asyncpg`). The limit is stated rather than left to be discovered: every
+query reads every stored vector, which at 384 dimensions and float32 is ~1.5 KB a
+row — the answer at 10⁵ rows is pgvector or a real ANN index, not a bigger matmul.
+
+**No index file either.** The table is the index. A file would be a cache of a small
+table, buying milliseconds in exchange for the one genuinely nasty bug here: a stale
+index returning confident answers about rows that no longer exist.
+
+**Vectors from two embedding models are never compared.** Every memory records which
+model produced it and a query only searches its own space. This matters more than it
+looks: cosine similarity across two embedding spaces is not a weak signal that
+degrades gracefully, it is a meaningless number in the same [-1, 1] range that still
+sorts. Change `SIBYL_EMBEDDING_MODEL` and existing memories become invisible until
+they are re-indexed — which is the honest behaviour, not a bug.
+
+**Indexing can never fail a job.** The forecast the caller asked for already
+succeeded; turning that into a `failed` row because an embedding model was missing
+would be an absurd trade. The worker logs and moves on.
+
+The embedder is injected, like the agent's LLM:
+
+```python
+from sibyl.vectorsearch.embeddings import build_embedder
+from sibyl.vectorsearch.store import recall
+
+hits = recall("weekly seasonality, no missing values", k=5, embedder=build_embedder())
+```
+
+That seam is what lets the whole layer be tested in CI with no model weights: the
+suite injects a five-dimensional word-count embedder, which is enough for "similar
+text ranks higher" to mean something and cheap enough to assert exact cosine values
+against.
+
+`build_embedder` caches per resolved model name, so the weights load once per
+process rather than once per job — the first live run loaded them four times for a
+three-job script before that was fixed. Caching on the *resolved* name matters:
+keying on the caller's `None` would file every environment-selected model under one
+entry, so changing `SIBYL_EMBEDDING_MODEL` would keep handing back the previous
+model, silently, with results that still look like results.
+
+### Prefer `data` over `query` — this is measured, not a hunch
+
+```bash
+pip install -e ".[db,vectorsearch]"
+python scripts/run_vectorsearch_live.py     # honours DATABASE_URL; scratch SQLite otherwise
+```
+
+Three real jobs indexed end to end, then searched with a fourth series that was
+never indexed. Against real `all-MiniLM-L6-v2`, on SQLite and on Postgres 16 alike:
+
+| Search | Top hit | Score | Correct? |
+|---|---|---|---|
+| `data`: 400 daily points, weekly cycle | daily, prophet | **+0.992** | ✅ |
+| `query`: *"a daily series with a strong weekly cycle and some anomalies"* | monthly, ets | **+0.474** | ❌ |
+
+The free-text query put the *monthly* memory first, by 0.474 to 0.459 — a margin
+small enough to be noise. That is not a weak embedding model: a one-line question
+and a six-line templated digest are different kinds of text, and cosine between them
+measures that difference as much as it measures the topic. **Free text is a
+convenience for exploring; the `data` form is the interface.**
+
+Note the spread on the `data` side too: 0.93–0.99 across three genuinely different
+series, because every digest shares the same six-line template. The ranking is
+right and the absolute numbers mean very little, so a similarity threshold needs
+measuring rather than a plausible-looking 0.8, which would match everything.
+
 ## Stack
 
 Core install is the numeric stack only. Everything else is an extra, so profiling a DataFrame does not pull in torch.
@@ -364,7 +492,7 @@ Core install is the numeric stack only. Everything else is an extra, so profilin
 | API | FastAPI, uvicorn | `[api]` | in use |
 | Agent | LangGraph, langchain-core | `[agents]` | in use |
 | LLM provider | one of langchain-{anthropic,openai,google-genai,mistralai,groq,ollama} | `[anthropic]` … `[ollama]` | in use, pick one |
-| Vector search | FAISS, sentence-transformers, PyTorch | `[vectorsearch]` | planned |
+| Vector search | sentence-transformers (search itself is numpy) | `[vectorsearch]` | in use |
 | Task queue | Celery + Redis | `[workers]` | in use |
 | Database | SQLAlchemy, psycopg, Alembic | `[db]` | in use |
 | Visualisation | Plotly, matplotlib | `[viz]` | planned |
@@ -425,9 +553,19 @@ Read by the persistence and task layers:
 | `DATABASE_URL` | SQLAlchemy URL; defaults to `sqlite:///./sibyl.db` so a fresh clone runs with no infrastructure |
 | `REDIS_URL` | Celery broker and result backend; defaults to `redis://localhost:6379/0` |
 
-Not read by any code yet: `WANDB_API_KEY`, `STRIPE_SECRET_KEY`,
-`FAISS_INDEX_PATH`. `.env` stays optional — the API and `docker compose up` both
-start without one.
+Read by vector search:
+
+| Variable | Purpose |
+|---|---|
+| `SIBYL_EMBEDDING_MODEL` | any sentence-transformers id; defaults to `all-MiniLM-L6-v2` |
+
+That one *does* have a default, unlike `SIBYL_LLM_PROVIDER`. The asymmetry is about
+consequences: guessing a chat provider fires a request at somebody's paid endpoint,
+while guessing an embedding model downloads open weights and runs them on the local
+CPU. There is no index path variable, because there is no index file.
+
+Not read by any code yet: `WANDB_API_KEY`, `STRIPE_SECRET_KEY`. `.env` stays
+optional — the API and `docker compose up` both start without one.
 
 ## CI
 

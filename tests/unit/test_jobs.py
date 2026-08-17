@@ -107,6 +107,67 @@ def test_worker_does_not_raise_on_a_failed_forecast(db):
     assert run_forecast_job(job_id) == JobStatus.failed
 
 
+# ── a finished job is remembered, but never at the cost of the job ────────────
+
+@pytest.fixture
+def indexed(db, stub_embedder, monkeypatch) -> Job:
+    """Run a job with the stub embedder standing in for the real one.
+
+    `_remember` imports build_embedder inside the function, so patching the
+    module it imports from is what reaches it — and that late import is itself
+    the reason a worker without [vectorsearch] installed still runs jobs.
+    """
+    from sibyl.vectorsearch import embeddings
+
+    monkeypatch.setattr(embeddings, "build_embedder", lambda *a, **k: stub_embedder)
+    job_id = _queue({
+        "records": _records(200), "target_column": "sales",
+        "model_name": "ets", "horizon": 7, "conformal": False,
+    })
+    run_forecast_job(job_id)
+    return _fetch(job_id)
+
+
+def test_a_successful_job_is_indexed(indexed, stub_embedder):
+    from sibyl.vectorsearch.store import recall
+
+    hits = recall(indexed.result["summary"], k=1, embedder=stub_embedder)
+    assert [h.job_id for h in hits] == [indexed.id]
+
+
+def test_a_failed_job_is_not_indexed(db, stub_embedder, monkeypatch):
+    from sibyl.vectorsearch import embeddings
+    from sibyl.vectorsearch.store import recall
+
+    monkeypatch.setattr(embeddings, "build_embedder", lambda *a, **k: stub_embedder)
+    job_id = _queue({
+        "records": _records(60, freq="ME"), "target_column": "sales",
+        "model_name": "prophet", "horizon": 7, "conformal": False,
+    })
+    run_forecast_job(job_id)
+
+    # There is no digest to remember and nothing to learn from: the forecast
+    # never ran, so there is no answer to attach to the diagnosis.
+    assert recall("anything", k=5, embedder=stub_embedder) == []
+
+
+def test_an_indexing_failure_does_not_fail_the_job(db, monkeypatch):
+    """The forecast already succeeded. A missing embedding model cannot undo that."""
+    from sibyl.vectorsearch import embeddings
+
+    def _explode(*args, **kwargs):
+        raise ImportError("sentence-transformers is not installed")
+
+    monkeypatch.setattr(embeddings, "build_embedder", _explode)
+    job_id = _queue({
+        "records": _records(200), "target_column": "sales",
+        "model_name": "ets", "horizon": 7, "conformal": False,
+    })
+
+    assert run_forecast_job(job_id) == JobStatus.done
+    assert _fetch(job_id).result is not None
+
+
 # ── a job that does not exist is a different kind of problem ──────────────────
 
 def test_missing_job_raises(db):
@@ -131,7 +192,7 @@ def test_migration_matches_the_models(tmp_path, monkeypatch):
 
     from sibyl.db.base import Base
     from sibyl.db.engine import get_engine, reset_engine
-    from sibyl.models import job  # noqa: F401
+    from sibyl.models import job, memory  # noqa: F401
 
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'migrated.db'}")
     reset_engine()

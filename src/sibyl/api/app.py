@@ -10,6 +10,10 @@ because a diagnosis is milliseconds; /forecast does not, because fitting Prophet
 is seconds and holding an HTTP connection open for it is how a service falls over
 under load. So /forecast writes a job, hands back an id, and returns 202.
 
+/search is inline too, and for the same reason as /diagnose: it is one embedding
+call plus a matrix multiply. It reads only what the worker has already written,
+so it stays a fast read path however slow the forecasts behind it were.
+
 The agent has no endpoint. It takes minutes, needs provider credentials in the
 worker, and its reliability depends on which model you point it at — none of
 which belongs behind an unqualified POST yet.
@@ -28,6 +32,8 @@ from forecasting.registry import MODELS
 from sibyl.db.engine import session_scope
 from sibyl.models.job import Job, JobStatus
 from sibyl.tasks.forecast import forecast_task
+from sibyl.vectorsearch.embeddings import build_embedder
+from sibyl.vectorsearch.store import MemoryHit, recall
 
 
 class DiagnoseRequest(BaseModel):
@@ -77,6 +83,29 @@ class JobResponse(BaseModel):
     status: JobStatus
     result: dict[str, Any] | None = None
     error: str | None = None
+
+
+class SearchRequest(BaseModel):
+    """Ask for past forecasts like this one — by description, or by the data itself.
+
+    `data` is the interesting half. Describing a series in words means guessing
+    which words the digest happened to use; posting the series instead runs the
+    same diagnosis the memories were built from, so both sides of the comparison
+    are written by the same code and the match is on what was actually measured.
+    """
+
+    query: str | None = None
+    data: list[dict[str, Any]] | None = None
+    target_column: str | None = None
+    k: int = Field(5, gt=0, le=50)
+
+
+class SearchResponse(BaseModel):
+    # `query` echoes back the text that was embedded, which for a `data` search is
+    # the digest the caller never saw. Without it a surprising ranking is
+    # un-debuggable: there is no way to tell a bad match from a bad query.
+    query: str
+    hits: list[MemoryHit]
 
 
 def create_app() -> FastAPI:
@@ -139,5 +168,37 @@ def create_app() -> FastAPI:
             return JobResponse(
                 id=job.id, status=JobStatus(job.status), result=job.result, error=job.error
             )
+
+    @app.post("/search", response_model=SearchResponse)
+    def search(request: SearchRequest) -> SearchResponse:
+        # Exactly one of the two. Rejecting both-at-once rather than picking a
+        # winner: a caller who sent both has a bug, and silently ignoring one of
+        # their inputs hides it behind results that look plausible.
+        if (request.query is None) == (request.data is None):
+            raise HTTPException(
+                status_code=422,
+                detail="Provide exactly one of 'query' (free text) or 'data' (records to diagnose)",
+            )
+
+        if request.query is not None:
+            text = request.query
+        else:
+            try:
+                report = run_full_diagnosis(
+                    pd.DataFrame(request.data), target_column=request.target_column
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            text = report.to_summary()
+
+        # 503, not 500: the service is fine and the request was fine, this one
+        # capability just is not installed. The message says which extra fixes it.
+        try:
+            embedder = build_embedder()
+            hits = recall(text, k=request.k, embedder=embedder)
+        except ImportError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+        return SearchResponse(query=text, hits=hits)
 
     return app

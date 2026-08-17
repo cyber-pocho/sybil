@@ -179,6 +179,77 @@ def test_full_round_trip_post_then_work_then_poll(db, no_broker, payload):
     assert body["error"] is None
 
 
+# ── search over past forecasts ────────────────────────────────────────────────
+
+@pytest.fixture
+def search_client(db, no_broker, stub_embedder, monkeypatch) -> TestClient:
+    """A client whose /search uses the stub embedder instead of downloading weights."""
+    from sibyl.api import app as app_module
+
+    monkeypatch.setattr(app_module, "build_embedder", lambda *a, **k: stub_embedder)
+    return TestClient(create_app())
+
+
+def _remember_one(job_id: str, text: str, model_name: str, embedder) -> None:
+    from sibyl.vectorsearch.store import remember
+
+    remember(job_id, text, model_name, {}, embedder)
+
+
+def test_search_by_text_finds_a_past_forecast(search_client, stub_embedder):
+    _remember_one("old-job", "Weekly seasonality, 3 anomalies flagged.", "prophet", stub_embedder)
+
+    r = search_client.post("/search", json={"query": "weekly seasonality with anomalies"})
+    assert r.status_code == 200
+    assert r.json()["hits"][0]["job_id"] == "old-job"
+    assert r.json()["hits"][0]["model_name"] == "prophet"
+
+
+def test_search_by_data_diagnoses_the_series_first(search_client, stub_embedder, payload):
+    _remember_one("old-job", "Weekly seasonality detected.", "prophet", stub_embedder)
+
+    r = search_client.post("/search", json={"data": payload, "target_column": "sales"})
+    assert r.status_code == 200
+    # The echoed query is the digest the endpoint built, not anything the caller
+    # wrote — which is what makes a surprising ranking debuggable.
+    assert len(r.json()["query"].splitlines()) == 6
+
+
+def test_search_respects_k(search_client, stub_embedder):
+    for i in range(4):
+        _remember_one(f"job-{i}", f"Weekly seasonality {i}.", "prophet", stub_embedder)
+    assert len(search_client.post("/search", json={"query": "weekly", "k": 2}).json()["hits"]) == 2
+
+
+def test_search_with_nothing_to_search_by_is_422(search_client):
+    assert search_client.post("/search", json={"k": 3}).status_code == 422
+
+
+def test_search_with_both_query_and_data_is_422(search_client, payload):
+    # A caller who sent both has a bug; picking one silently hides it.
+    r = search_client.post("/search", json={"query": "weekly", "data": payload})
+    assert r.status_code == 422
+
+
+def test_search_on_an_empty_store_returns_no_hits(search_client):
+    r = search_client.post("/search", json={"query": "weekly"})
+    assert r.status_code == 200
+    assert r.json()["hits"] == []
+
+
+def test_search_without_the_extra_installed_is_503(db, no_broker, monkeypatch):
+    """Not a 500: the service is fine, this one capability just is not installed."""
+    from sibyl.api import app as app_module
+
+    def _explode(*args, **kwargs):
+        raise ImportError('Install it with: pip install -e ".[vectorsearch]"')
+
+    monkeypatch.setattr(app_module, "build_embedder", _explode)
+    r = TestClient(create_app()).post("/search", json={"query": "weekly"})
+    assert r.status_code == 503
+    assert "vectorsearch" in r.json()["detail"]
+
+
 def test_round_trip_records_a_failure(db, no_broker, payload):
     from sibyl.tasks.forecast import run_forecast_job
 

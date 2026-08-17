@@ -51,6 +51,9 @@ def run_forecast_job(job_id: str) -> str:
         result, error = None, f"{type(exc).__name__}: {exc}"
         logger.warning("job %s failed: %s", job_id, error)
 
+    if error is None:
+        _remember(job_id, params, result)
+
     with session_scope() as session:
         job = session.get(Job, job_id)
         job.status = JobStatus.done if error is None else JobStatus.failed
@@ -58,6 +61,29 @@ def run_forecast_job(job_id: str) -> str:
         job.error = error
         job.finished_at = datetime.now(UTC)
         return job.status
+
+
+def _remember(job_id: str, params: dict, result: dict) -> None:
+    """Index a successful forecast so later ones can find it. Best effort, always.
+
+    Two things this must not do. It must not fail the job: the forecast the caller
+    asked for already succeeded, and turning that into a `failed` row because an
+    embedding model was missing would be an absurd trade. And it must not require
+    [vectorsearch] to be installed — the import is inside the function so a worker
+    running without it starts, runs jobs, and simply remembers nothing.
+
+    Installing the extra is therefore the whole switch. There is no flag, because
+    a flag would be a second thing to get wrong, and "vector search is on if you
+    installed vector search" needs no documentation.
+    """
+    try:
+        from sibyl.vectorsearch.embeddings import build_embedder
+        from sibyl.vectorsearch.store import remember_job
+
+        remember_job(job_id, params, result, build_embedder())
+    except Exception as exc:
+        logger.warning("job %s completed but was not indexed: %s: %s",
+                       job_id, type(exc).__name__, exc)
 
 
 @celery_app.task(name="sibyl.forecast")

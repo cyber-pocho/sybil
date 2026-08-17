@@ -16,7 +16,7 @@ from sqlalchemy import engine_from_config, pool
 from alembic import context
 from sibyl.db.base import Base
 from sibyl.db.engine import database_url
-from sibyl.models import job  # noqa: F401  (registers Job on Base.metadata)
+from sibyl.models import job, memory  # noqa: F401  (registers them on Base.metadata)
 
 config = context.config
 if config.config_file_name is not None:

@@ -8,7 +8,36 @@ are opt-in, and importing SQLAlchemy at collection time would break the suite fo
 anyone who installed the project without the [db] extra.
 """
 
+import numpy as np
 import pytest
+
+
+class WordCountEmbedder:
+    """A five-dimensional stand-in for a real embedding model.
+
+    Each dimension counts one word that the diagnosis digest actually uses, so
+    two summaries describing similar series land near each other and a query
+    about a weekly series scores above one about a monthly one. That is all the
+    tests need from an embedding: real semantics would make them slower, less
+    deterministic, and no more able to catch a bug in the search or the store.
+
+    Injected the same way the agent's stub LLM is, through the seam the
+    production code already has, so nothing is stubbed that ships.
+    """
+
+    VOCAB = ("weekly", "monthly", "anomalies", "stationary", "missing")
+
+    def __init__(self, name: str = "word-count-stub") -> None:
+        self.name = name
+
+    def encode(self, texts: list[str]) -> np.ndarray:
+        counts = [[t.lower().count(word) for word in self.VOCAB] for t in texts]
+        return np.asarray(counts, dtype=np.float32)
+
+
+@pytest.fixture
+def stub_embedder():
+    return WordCountEmbedder()
 
 
 @pytest.fixture
@@ -18,7 +47,7 @@ def db(tmp_path, monkeypatch):
 
     from sibyl.db.base import Base
     from sibyl.db.engine import get_engine, reset_engine
-    from sibyl.models import job  # noqa: F401  (registers Job on Base.metadata)
+    from sibyl.models import job, memory  # noqa: F401  (registers them on Base.metadata)
 
     reset_engine()
     Base.metadata.create_all(get_engine())

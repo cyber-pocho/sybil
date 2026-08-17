@@ -1,7 +1,7 @@
 # Sibyl — Project Status Report
 
-**Date:** 2026-08-16
-**Branch:** `agent/provider-agnostic` @ `c56e45e`, pushed; not yet merged to `main`
+**Date:** 2026-08-17
+**Branch:** `agent/provider-agnostic` @ `218f6fb` + the vector search work below
 **Basis:** full read-through, plus clean-room installs at three dependency levels,
 lint, the test suite, Alembic against SQLite and real Postgres, a live agent run
 against a local model, a real Redis/Celery/Postgres job round trip, a Docker build
@@ -11,18 +11,20 @@ and full `docker compose` probe, and the GitHub Actions history
 
 ## Verdict in one paragraph
 
-**Diagnosis, forecasting, the HTTP API, the agent, the task queue and persistence
-all work.** Vector search remains unstarted. The repository's defining problem —
+**Every layer in the original plan now exists.** Vector search — the last one — is
+built, and the HTTP API, tasks and persistence it plugs into were already working.
+The repository's defining problem —
 a broken build backend that made `pip install -e .` fail, so **CI failed on all 10
 commits and never executed a single test** — is fixed, and CI has since gone green
 twice on Python 3.11. The suite went from *119 passed / 8 failed / 20 errors / 2
-skipped* to **244 passed, 0 failed, 0 skipped**; `ruff check` from 30 errors to
+skipped* to **279 passed, 0 failed, 0 skipped**; `ruff check` from 30 errors to
 clean. The agent is now provider-agnostic — it runs on any tool-calling chat model,
 closed or open weights — and that change surfaced a second dependency-ceiling bug of
-the same family as the original MAPIE one. The agent has now been run for real
-against a local model, and the forecast job path against a real Redis, Celery worker
-and Postgres. What remains unexercised is a live agent round-trip against any
-*hosted* provider.
+the same family as the original MAPIE one. The agent has been run for real against a
+local model, and the forecast job path against a real Redis, Celery worker and
+Postgres, and vector search against a real `all-MiniLM-L6-v2` — three jobs indexed
+end to end and retrieved in the right order. What remains unexercised is a live
+agent round-trip against any *hosted* provider.
 
 ---
 
@@ -34,8 +36,12 @@ Everything below was executed, not inferred.
 |---|---|
 | `pip install -e ".[dev,api,agents,db,workers]"` (fresh venv) | ✅ exit 0 |
 | `ruff check src/ tests/ scripts/ alembic/` | ✅ All checks passed |
-| `pytest tests/` | ✅ **244 passed**, 0 failed, 0 skipped |
-| Same suite with no provider package installed | ✅ 244 passed — the agent core carries no vendor dep |
+| `pytest tests/` | ✅ **279 passed**, 0 failed, 0 skipped |
+| Same suite with no provider package installed | ✅ the agent core carries no vendor dep |
+| Same suite with `sentence_transformers` and `torch` imports blocked | ✅ 279 passed — what CI actually runs |
+| Same suite **with** `[vectorsearch]` installed | ✅ 279 passed — the stub path and the real one coexist |
+| `alembic upgrade head` → `downgrade base` → `upgrade head`, with `0002_memories` | ✅ round-trips |
+| Vector search live against real `all-MiniLM-L6-v2` | ✅ 3 jobs indexed end to end, correct ranking; see below |
 | GitHub Actions on Python 3.11 | ✅ green — Install, Lint, Test all `success` |
 | `docker compose config` | ✅ valid |
 | `alembic upgrade head` → SQLite, then downgrade → upgrade | ✅ round-trips |
@@ -49,11 +55,11 @@ Everything below was executed, not inferred.
 |---|---|---|
 | `pip install -e .` | ❌ `BackendUnavailable` | ✅ exit 0 |
 | CI outcome | ❌ 10/10 runs failed at install | ✅ green |
-| Tests executed in CI | **0, ever** | 244 |
-| Test results | 119 pass / 8 fail / 20 error / 2 skip | **244 pass / 0 fail / 0 skip** |
+| Tests executed in CI | **0, ever** | 279 |
+| Test results | 119 pass / 8 fail / 20 error / 2 skip | **279 pass / 0 fail / 0 skip** |
 | `ruff check` | 30 errors | **0** |
-| Source LOC | 1,383 | 2,349 |
-| Test LOC | 1,226 | 2,192 |
+| Source LOC | 1,383 | 2,833 |
+| Test LOC | 1,226 | 2,597 |
 | LLM providers supported | 1 (hardcoded) | **7, none privileged** |
 
 ---
@@ -72,15 +78,18 @@ Everything below was executed, not inferred.
 | `forecasting/prophet_model.py` | 143 | 22 | ✅ unchanged behaviour |
 | `forecasting/ets_model.py` | 206 | 28 | ✅ **fixed** — was completely broken |
 | `forecasting/conformal.py` | 133 | 22 | ✅ `ConformalWrapper` only; MAPIE removed |
-| `sibyl/api/app.py` | 143 | 20 | ✅ `/health`, `/diagnose`, `/forecast` + polling |
+| `sibyl/api/app.py` | 204 | 27 | ✅ `/health`, `/diagnose`, `/forecast` + polling, `/search` |
 | `sibyl/agents/forecaster_agent.py` | 252 | 21 | ✅ run live 8× against a local model |
 | `sibyl/agents/llm.py` | 218 | 32 | ✅ provider registry; 7 providers, 3 constructed for real |
 | `forecasting/registry.py` | 46 | — | ✅ shared by the agent and the worker |
 | `sibyl/services/forecasting.py` | 93 | 12 | ✅ pure: no db, no queue, no HTTP |
 | `sibyl/models/job.py` | 62 | — | ✅ one table, JSON params and result |
+| `sibyl/models/memory.py` | 74 | — | ✅ `memories`: text, float32 vector, model, metadata |
 | `sibyl/db/{engine,base}.py` | 88 | — | ✅ sync engine, lazily built |
-| `sibyl/tasks/{celery_app,forecast}.py` | 105 | 11 | ✅ verified against a real broker |
-| Vector search | — | — | ⛔ not started; no package exists, only the `[vectorsearch]` extra |
+| `sibyl/tasks/{celery_app,forecast}.py` | 131 | 14 | ✅ verified against a real broker; now indexes on success |
+| `sibyl/vectorsearch/search.py` | 60 | 9 | ✅ exact cosine top-k in numpy; no FAISS |
+| `sibyl/vectorsearch/store.py` | 136 | 12 | ✅ remember / recall, one embedding space at a time |
+| `sibyl/vectorsearch/embeddings.py` | 113 | 5 | ✅ run live against `all-MiniLM-L6-v2`; cached after that run showed why |
 
 ---
 
@@ -428,12 +437,142 @@ test was named `test_empty_data_is_rejected`, which already existed for
 duplicate `test_series_with_nans_handled` in §5, found this time by the linter
 rather than by a full read-through.
 
+### Vector search — `src/sibyl/vectorsearch/`
+
+The last unbuilt layer, and the one the repository had been carrying a stub of
+since the first commit: a `[vectorsearch]` extra declaring three packages against
+no code at all.
+
+Every forecast the worker finishes is now remembered — its six-line diagnosis
+digest embedded and stored next to the model that was run on it — and `POST
+/search` retrieves the closest ones. That answers the question the `jobs` table
+structurally cannot: *have we seen a series like this before, and what did we do
+about it?* The endpoint takes free text or, more usefully, the series itself, in
+which case it runs the same `run_full_diagnosis` the memories were built from, so
+both sides of the comparison are written by the same code rather than by a caller
+guessing which words the digest happened to use.
+
+Three files, one per question: `embeddings.py` (text → vector), `search.py`
+(vectors → ranking), `store.py` (rows ↔ vectors). Twenty-one tests for the layer
+itself, seven more on the endpoint, three on the worker hook.
+
+Decisions worth recording:
+
+- **FAISS was removed from the extra rather than imported.** A flat index over a
+  few thousand past forecasts *is* a matmul plus a partial sort — `search.py` is
+  60 lines of numpy including the docstring. FAISS earns itself when you are
+  willing to trade exactness for speed over millions of vectors, which is not this.
+  A compiled dependency nobody imports is precisely the pattern that has already
+  cost this project twice, and it is worth noticing that both `mapie` and
+  `asyncpg` were also declared for a design that was never built. The scaling
+  limit is written into the module docstring rather than left to be discovered:
+  every query reads every vector, and the answer at 10⁵ rows is pgvector or a real
+  ANN index, not a bigger matmul.
+- **No index file. The table is the index.** A file would cache a small table for
+  a few milliseconds and buy the one genuinely nasty bug in this area — a stale
+  index answering confidently about rows that no longer exist. `FAISS_INDEX_PATH`
+  is gone from `.env.example` along with it; it had never been read by anything.
+- **Vectors from two embedding models are never compared.** Every row records the
+  model that produced it and every query filters on it. This is the failure mode
+  that most deserved a test of its own, because nothing about it looks broken:
+  cosine across two embedding spaces does not degrade gracefully into a weak
+  signal, it produces a meaningless number in the same [-1, 1] range that still
+  sorts. Changing `SIBYL_EMBEDDING_MODEL` makes old memories invisible until
+  re-indexed, which is the honest behaviour and not a bug.
+- **Indexing can never fail a job.** The worker catches everything and logs. The
+  forecast the caller asked for already succeeded; turning that into a `failed`
+  row because an embedding model was missing would be an absurd trade.
+- **The extra is the switch.** The `build_embedder` import lives inside the
+  function that uses it, so a worker without `[vectorsearch]` starts, runs jobs,
+  and remembers nothing. No environment flag, because a flag is a second thing to
+  get wrong, and "vector search is on if you installed vector search" needs no
+  documentation. `/search` on such a deployment returns **503, not 500** — the
+  service is fine and the request was fine, this one capability is not installed,
+  and the message names the extra that fixes it.
+- **The embedder is injected, exactly like the agent's LLM.** That is what lets
+  the layer be fully tested in CI with no model weights: the suite passes a
+  five-dimensional word-count embedder, which is enough for "similar text ranks
+  higher" to mean something and cheap enough to assert *exact* cosine values
+  against — 1.0 for identical, 0.0 for orthogonal, -1.0 for opposite. Asserting
+  "is roughly sorted" would have been the easy version and would have caught less.
+- **`SIBYL_EMBEDDING_MODEL` has a default, and `SIBYL_LLM_PROVIDER` still does
+  not.** The asymmetry is about consequences, not consistency: a defaulted chat
+  provider fires a request at somebody's paid endpoint, while a defaulted
+  embedding model downloads open weights and runs them on the local CPU.
+
+#### What the first live run found
+
+`scripts/run_vectorsearch_live.py` runs three real forecast jobs end to end —
+diagnose, fit, predict, embed, store — against a scratch SQLite file, then
+searches with a *fourth* series that was never indexed. Searching with one of the
+three would only have proved that a vector equals itself.
+
+Against real `all-MiniLM-L6-v2`: 384 dimensions, unit norm, and the ranking is
+right. The query was 400 daily points with a weekly cycle:
+
+| Rank | Score | Memory |
+|---|---|---|
+| 1 | +0.992 | 365 daily, weekly cycle, prophet |
+| 2 | +0.958 | 480 hourly, daily cycle + spikes, ets |
+| 3 | +0.929 | 60 monthly, trend only, ets |
+
+Identical rankings on SQLite and on real Postgres 16, and the stored vectors are
+384 dims at 1,536 bytes a row — exactly 4 bytes a dimension, so `LargeBinary`
+round-trips through `BYTEA` with nothing lost or padded.
+
+**The `query` form is much weaker than the `data` form, and now there are numbers
+for it.** Run against a real Postgres with those same three memories, through a
+real uvicorn rather than the test client:
+
+| Search | Top hit | Score | Correct? |
+|---|---|---|---|
+| `data`: 400 daily points, weekly cycle | daily, prophet | **+0.992** | ✅ |
+| `query`: *"a daily series with a strong weekly cycle and some anomalies"* | monthly, ets | **+0.474** | ❌ |
+
+The free-text query put the *monthly* memory first, 0.474 against the daily
+memory's 0.459 — a margin small enough to be noise. The cause is not a weak
+embedding model: a one-line question and a six-line templated digest are simply
+different kinds of text, and cosine between them measures that difference as much
+as it measures the topic.
+
+This is worth stating plainly because it is the design argument made concrete.
+`data` was included because posting the series runs the same
+`run_full_diagnosis` the memories were built from, so both sides of the
+comparison are written by the same code. That was a reasoned guess when the
+endpoint was written; it is now a measurement. **Free text is a convenience for
+exploring; the `data` form is the interface.**
+
+Also visible in that table: the `data`-form scores span 0.93–0.99 across three
+genuinely different series, because all three digests share a six-line template
+and most of their tokens. The ranking is right and the absolute numbers mean very
+little. Anyone tempted to add a similarity threshold should measure where to put
+it rather than reaching for 0.8, which would match everything.
+
+**One defect, found only by running it.** The model reloaded on *every* job: the
+worker calls `build_embedder()` per job and the endpoint per request, and each
+fresh instance loaded 90 MB of weights — four loads for a three-job script. Fixed
+by caching in `build_embedder`, which now loads once per process.
+
+The cache is keyed on the *resolved* model name, not the caller's argument. Keying
+on the raw `None` would file every environment-selected model under one entry, so
+changing `SIBYL_EMBEDDING_MODEL` would keep returning the previous model —
+silently, and with results that still look like results. That is the same shape as
+the two "passed for the wrong reason" bugs in the agent work, and it has its own
+test for the same reason.
+
 ---
 
 ## What remains
 
 **Not yet verified:**
 
+- **Only one embedding model has been run**, and only on CPU. `all-MiniLM-L6-v2`
+  is the default and the one the live script used; any other sentence-transformers
+  id is verified as far as the interface and no further.
+- **The `query` form ranks badly and has been measured doing so once**, on three
+  memories. One free-text query getting the order wrong is a demonstration, not a
+  benchmark — it is enough to say "prefer the `data` form" and not enough to say
+  how much worse free text is in general.
 - **No hosted provider has been called.** The live verification below used a local
   `ollama` model only. Nothing has exercised Anthropic, OpenAI, Google, Mistral or
   Groq end to end, so their registry rows are verified as far as constructing a
@@ -473,11 +612,14 @@ rather than by a full read-through.
 1. Run the agent against a hosted provider and compare with the local baseline
    above — in particular whether the 4-call recovery path works at all on a
    frontier model, which would confirm the ceiling is the model and not the design.
-2. Decide whether the agent gets an endpoint. It is the one layer with no HTTP
+3. Give the agent a `recall` tool. It reads `ModelCard`s to pick a model today;
+   "here is what we ran on five similar series, and what happened" is strictly
+   better evidence, and the store already returns exactly that. This is the reason
+   vector search was worth building and it is one tool function away.
+4. Decide whether the agent gets an endpoint. It is the one layer with no HTTP
    surface, deliberately: minutes per run, provider credentials in the worker, and
    the reliability profile measured above.
-3. Fix the noiseless-linear-series crash listed above, or decide it is not worth it.
-4. Then vector search, with `[vectorsearch]` promoted as it lands.
+5. Fix the noiseless-linear-series crash listed above, or decide it is not worth it.
 
 ---
 

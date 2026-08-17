@@ -18,6 +18,11 @@ RUN mkdir -p src/sibyl src/diagnosis src/forecasting \
 
 # The image runs both the API and the worker (same image, different
 # command in compose), and both import the persistence layer.
+#
+# [vectorsearch] is deliberately absent: it pulls torch, which would take this
+# image from ~1 GB to several. The code handles its absence as a first-class
+# case — the worker indexes nothing and /search answers 503 naming the extra —
+# so add it here when you want semantic recall, and pay for it knowingly.
 RUN pip install --prefix=/install --no-cache-dir ".[api,db,workers]"
 
 
